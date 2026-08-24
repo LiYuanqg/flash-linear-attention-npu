@@ -1,9 +1,9 @@
 {
     "config": {
-        "B": 4,
-        "HK": 96,
-        "HV": 96,
-        "T": 128,
+        "B": 1,
+        "HK": 32,
+        "HV": 32,
+        "T": 160,
         "K": 128,
         "V": 128,
         "varlen_sequences": null,
@@ -22,9 +22,9 @@
         "use_gate_in_kernel": true,
         "l2_epsilon": 1e-06,
         "layout": "BSND",
-        "case_id": "case_02",
+        "case_id": "case_03",
         "dtype": "bfloat16",
-        "seed": 20260825,
+        "seed": 20260826,
         "initial_state": "None (not specified by the requested case table)",
         "cu_seqlens_generation": "None",
         "input_ranges": {
@@ -35,7 +35,7 @@
             "dt_bias": "normal(0, 0.2), FP32"
         },
         "input_generator_version": 2,
-        "input_bundle_id": "901232957c09733237699d8bb08ccc74c631fe81a38601d645f402a6f223d17f"
+        "input_bundle_id": "5dea888e3b2ca186f9cc72241abb6deb0cda7a7e8b7bccb81c0ece1aeb836f22"
     },
     "comparison_context": {
         "chunk_size": 64,

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import math
-from typing import Optional
+import re
+from pathlib import Path
+from typing import Iterable, Optional
 
 import torch
 
@@ -29,6 +32,67 @@ def uniform(shape, *, dtype: torch.dtype, device: torch.device | str = "cpu") ->
     return torch.rand(*shape, dtype=dtype, device=device) * 2 - 1
 
 
+def normal(
+    shape,
+    *,
+    mean: float,
+    std: float,
+    dtype: torch.dtype,
+    device: torch.device | str = "cpu",
+) -> torch.Tensor:
+    return torch.randn(*shape, dtype=dtype, device=device) * std + mean
+
+
+def iter_chunks(
+    tokens: int,
+    chunk_size: int,
+    cu_seqlens: Optional[Iterable[int]] = None,
+) -> Iterable[tuple[int, int]]:
+    """Yield (start, end) for each chunk, including a leftover tail and varlen spans."""
+    if cu_seqlens is None:
+        for start in range(0, tokens, chunk_size):
+            yield start, min(start + chunk_size, tokens)
+        return
+    cu = [int(x) for x in cu_seqlens]
+    if not cu or cu[0] != 0 or cu[-1] != tokens:
+        raise ValueError(f"cu_seqlens must start at 0 and end at T={tokens}, got {cu[:1]}...{cu[-1:]}")
+    for start, end in zip(cu[:-1], cu[1:]):
+        if end < start:
+            raise ValueError(f"cu_seqlens is not nondecreasing around {start}->{end}")
+        for chunk_start in range(start, end, chunk_size):
+            yield chunk_start, min(chunk_start + chunk_size, end)
+
+
+def parse_normal_spec(spec: str) -> tuple[float, float]:
+    match = re.fullmatch(r"normal\(\s*([+-]?\d+(?:\.\d+)?)\s*,\s*([+-]?\d+(?:\.\d+)?)\s*\)(?:,.*)?", spec.strip())
+    if match is None:
+        raise ValueError(f"unsupported input range spec: {spec}")
+    return float(match.group(1)), float(match.group(2))
+
+
+def load_case(path: str | Path) -> dict:
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    cfg = data["config"]
+    ctx = data.get("comparison_context") or {}
+    return {
+        "case_id": cfg.get("case_id", Path(path).stem),
+        "batch": int(cfg["B"]),
+        "tokens": int(cfg["T"]),
+        "hk": int(cfg["HK"]),
+        "hv": int(cfg["HV"]),
+        "k_dim": int(cfg["K"]),
+        "v_dim": int(cfg["V"]),
+        "chunk_size": int(cfg["chunk_size"]),
+        "dtype": str(cfg["dtype"]),
+        "seed": int(cfg["seed"]),
+        "safe_gate": bool(cfg["safe_gate"]),
+        "use_gate": bool(cfg["use_gate_in_kernel"]),
+        "lower_bound": float(cfg["lower_bound"]),
+        "cu_seqlens": ctx.get("cu_seqlens"),
+        "input_ranges": cfg["input_ranges"],
+    }
+
+
 def make_akk(
     batch: int,
     tokens: int,
@@ -36,16 +100,24 @@ def make_akk(
     chunk_size: int,
     dtype: torch.dtype,
     device: torch.device | str = "cpu",
+    cu_seqlens: Optional[Iterable[int]] = None,
+    fill: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Sequence-major Akk-like matrix: [B, T, HV, BT], lower-triangular + I per chunk."""
-    akk = uniform((batch, tokens, hv, chunk_size), dtype=dtype, device=device)
-    lower = torch.tril(torch.ones(chunk_size, chunk_size, dtype=dtype, device=device))
-    eye = torch.eye(chunk_size, dtype=dtype, device=device)
-    for start in range(0, tokens, chunk_size):
-        block = akk[:, start : start + chunk_size]
-        akk[:, start : start + chunk_size] = (
-            block * lower.view(1, chunk_size, 1, chunk_size)
-            + eye.view(1, chunk_size, 1, chunk_size)
+    """Sequence-major Akk-like matrix: [B, T, HV, BT], lower-triangular + I per chunk.
+
+    Leftover tails shorter than `chunk_size` only fill `A[..., :length]`. Extra columns
+    stay 0 so C0's BT×BT dot (padded time rows = 0) matches the length×length matmul.
+    """
+    akk = torch.zeros((batch, tokens, hv, chunk_size), dtype=dtype, device=device)
+    if fill is None:
+        fill = uniform((batch, tokens, hv, chunk_size), dtype=dtype, device=device)
+    for start, end in iter_chunks(tokens, chunk_size, cu_seqlens):
+        length = end - start
+        lower = torch.tril(torch.ones(length, length, dtype=dtype, device=device))
+        eye = torch.eye(length, dtype=dtype, device=device)
+        block = fill[:, start:end, :, :length]
+        akk[:, start:end, :, :length] = (
+            block * lower.view(1, length, 1, length) + eye.view(1, length, 1, length)
         )
     return akk
 
@@ -62,6 +134,8 @@ def make_inputs(
     dtype: torch.dtype,
     seed: int,
     device: torch.device | str = "cpu",
+    cu_seqlens: Optional[Iterable[int]] = None,
+    input_ranges: Optional[dict[str, str]] = None,
 ) -> dict[str, torch.Tensor]:
     """Generate head-first tensors with a fixed RNG stream.
 
@@ -72,22 +146,37 @@ def make_inputs(
     A_log: [HV]
     dt_bias: [HV, K]
     A: [B, T, HV, BT] sequence-major, matching FLA recompute_w_u_fwd
+
+    Default fill is uniform(-1, 1). Case JSON uses `input_ranges` with normal().
+    Leftover T and varlen `cu_seqlens` are allowed; T need not be a multiple of chunk_size.
     """
     if hv % hk != 0:
         raise ValueError("HV must be divisible by HK")
-    if tokens % chunk_size != 0:
-        raise ValueError("tokens must be divisible by chunk-size for this golden")
+    if cu_seqlens is not None and batch != 1:
+        raise ValueError("varlen golden only supports B=1")
     torch.manual_seed(seed)
-    return {
-        "q": uniform((batch, hk, tokens, k_dim), dtype=dtype, device=device),
-        "k": uniform((batch, hk, tokens, k_dim), dtype=dtype, device=device),
-        "v": uniform((batch, hv, tokens, v_dim), dtype=dtype, device=device),
-        "g": uniform((batch, hv, tokens, k_dim), dtype=torch.float32, device=device),
-        "beta": uniform((batch, hv, tokens), dtype=dtype, device=device),
-        "A_log": uniform((hv,), dtype=torch.float32, device=device),
-        "dt_bias": uniform((hv, k_dim), dtype=torch.float32, device=device),
-        "A": make_akk(batch, tokens, hv, chunk_size, dtype, device),
+
+    def fill(shape, spec_key: str, fill_dtype: torch.dtype) -> torch.Tensor:
+        if input_ranges is None:
+            return uniform(shape, dtype=fill_dtype, device=device)
+        mean, std = parse_normal_spec(input_ranges[spec_key])
+        return normal(shape, mean=mean, std=std, dtype=fill_dtype, device=device)
+
+    tensors = {
+        "q": fill((batch, hk, tokens, k_dim), "q_k_v", dtype),
+        "k": fill((batch, hk, tokens, k_dim), "q_k_v", dtype),
+        "v": fill((batch, hv, tokens, v_dim), "q_k_v", dtype),
+        "g": fill((batch, hv, tokens, k_dim), "g_raw", torch.float32),
+        "beta": fill((batch, hv, tokens), "beta_raw", dtype),
+        "A_log": fill((hv,), "A_log", torch.float32),
+        "dt_bias": fill((hv, k_dim), "dt_bias", torch.float32),
     }
+    tensors["A"] = make_akk(
+        batch, tokens, hv, chunk_size, dtype, device,
+        cu_seqlens=cu_seqlens,
+        fill=fill((batch, tokens, hv, chunk_size), "q_k_v", dtype),
+    )
+    return tensors
 
 
 def head_to_seq(tensor: torch.Tensor) -> torch.Tensor:

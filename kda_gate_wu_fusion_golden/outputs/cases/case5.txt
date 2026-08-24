@@ -1,0 +1,22 @@
+# case_05
+CPU FP32 vs staged Triton
+g_corr abs_mean=5.8652e-08 abs_max=7.1526e-07 rel_p99=1.9386e-07 cosine=0.99999905
+gk abs_mean=4.7895e-06 abs_max=7.6294e-05 rel_p99=1.7845e-07 cosine=1.00007570
+qg abs_mean=1.5949e-07 abs_max=1.1202e-04 rel_p99=2.3189e-03 cosine=1.00001085
+kbg abs_mean=1.3972e-07 abs_max=2.3463e-04 rel_p99=2.2829e-03 cosine=1.00001013
+vb abs_mean=8.7311e-05 abs_max=3.2654e-03 rel_p99=3.4572e-03 cosine=1.00006616
+kg abs_mean=1.6052e-07 abs_max=1.0982e-04 rel_p99=2.3303e-03 cosine=1.00001454
+w abs_mean=1.0934e-06 abs_max=4.5226e-04 rel_p99=1.5621e-02 cosine=1.00022364
+u abs_mean=1.6630e-04 abs_max=4.2397e-03 rel_p99=6.6499e-02 cosine=1.00001228
+CPU FP32 vs FLA kda_gate_chunk_cumsum+recompute_w_u_fwd
+gk abs_mean=4.7895e-06 abs_max=7.6294e-05 rel_p99=1.7845e-07 cosine=1.00007570
+qg abs_mean=1.5949e-07 abs_max=1.1202e-04 rel_p99=2.3189e-03 cosine=1.00001085
+kg abs_mean=1.6052e-07 abs_max=1.0982e-04 rel_p99=2.3303e-03 cosine=1.00001454
+w abs_mean=1.3231e-06 abs_max=5.2430e-04 rel_p99=2.1670e-02 cosine=1.00022292
+u abs_mean=1.6630e-04 abs_max=4.2397e-03 rel_p99=6.6499e-02 cosine=1.00001228
+staged Triton vs FLA
+gk abs_mean=0.0000e+00 abs_max=0.0000e+00 rel_p99=0.0000e+00 cosine=1.00007570
+qg abs_mean=0.0000e+00 abs_max=0.0000e+00 rel_p99=0.0000e+00 cosine=1.00001287
+kg abs_mean=2.7118e-10 abs_max=1.2207e-04 rel_p99=0.0000e+00 cosine=1.00001383
+w abs_mean=8.1184e-07 abs_max=9.7656e-04 rel_p99=2.2059e-02 cosine=1.00019646
+u abs_mean=0.0000e+00 abs_max=0.0000e+00 rel_p99=0.0000e+00 cosine=0.99995315

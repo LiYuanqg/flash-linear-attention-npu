@@ -136,7 +136,7 @@ def c0_kernel(
     o_t = i_t * BT + tl.arange(0, BT)
     m_t = o_t < T
     o_A = tl.arange(0, BT)
-    m_A = m_t[:, None] & (o_A[None, :] < BT)
+    m_A = m_t[:, None] & (o_A[None, :] < tl.minimum(BT, T - i_t * BT))
     p_A = A + ((bos + o_t) * HV + i_hv)[:, None] * BT + o_A[None, :]
     b_A = tl.load(p_A, mask=m_A, other=0.0)
 
@@ -159,6 +159,12 @@ def c0_kernel(
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), mask=m_k)
 
 
+def _slice_seq(tensor: torch.Tensor, start: int, end: int, time_dim: int = 1) -> torch.Tensor:
+    sl = [slice(None)] * tensor.ndim
+    sl[time_dim] = slice(start, end)
+    return tensor[tuple(sl)]
+
+
 def run_staged(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -173,8 +179,32 @@ def run_staged(
     use_gate: bool,
     safe_gate: bool,
     lower_bound: float,
+    cu_seqlens: list[int] | torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """All tensors are sequence-major: q/k [B,T,HK,K], v [B,T,HV,V], g [B,T,HV,K]."""
+    if cu_seqlens is not None:
+        cu = [int(x) for x in cu_seqlens]
+        if q.shape[0] != 1:
+            raise ValueError("varlen staged path requires B=1")
+        names = ("g_corr", "gk", "qg", "kbg", "vb", "kg", "w", "u")
+        outputs = {name: None for name in names}
+        for start, end in zip(cu[:-1], cu[1:]):
+            part = run_staged(
+                _slice_seq(q, start, end), _slice_seq(k, start, end),
+                _slice_seq(v, start, end), _slice_seq(g, start, end),
+                _slice_seq(beta, start, end), _slice_seq(A, start, end),
+                A_log, dt_bias,
+                chunk_size=chunk_size, use_gate=use_gate,
+                safe_gate=safe_gate, lower_bound=lower_bound,
+            )
+            for name in names:
+                if outputs[name] is None:
+                    full_shape = list(part[name].shape)
+                    full_shape[1] = q.shape[1]
+                    outputs[name] = torch.empty(full_shape, device=part[name].device, dtype=part[name].dtype)
+                outputs[name][:, start:end] = part[name]
+        return outputs
+
     B, T, H, K = k.shape
     HV, V = v.shape[2], v.shape[-1]
     BT = chunk_size
@@ -226,16 +256,42 @@ def run_fla(
     use_gate: bool,
     safe_gate: bool,
     lower_bound: float,
+    cu_seqlens: list[int] | torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Official FLA path: kda_gate_chunk_cumsum / chunk_local_cumsum + recompute_w_u_fwd.
 
-    Does not expose workspace kbg/vb.
+    Does not expose workspace kbg/vb. Varlen is run per sequence so leftover
+    chunks and packed T>GPU memory still fit; each call is the official fused kernels.
     """
     from fla.ops.kda.gate import kda_gate_chunk_cumsum
     from fla.ops.kda.wy_fast import recompute_w_u_fwd
     from fla.ops.utils import chunk_local_cumsum
     from fla.ops.utils.constant import RCP_LN2 as FLA_RCP_LN2
 
+    if cu_seqlens is not None:
+        cu = [int(x) for x in cu_seqlens]
+        if q.shape[0] != 1:
+            raise ValueError("varlen FLA path requires B=1")
+        names = ("gk", "qg", "kg", "w", "u")
+        outputs = {}
+        for start, end in zip(cu[:-1], cu[1:]):
+            part = run_fla(
+                _slice_seq(q, start, end), _slice_seq(k, start, end),
+                _slice_seq(v, start, end), _slice_seq(g, start, end),
+                _slice_seq(beta, start, end), _slice_seq(A, start, end),
+                A_log, dt_bias,
+                chunk_size=chunk_size, use_gate=use_gate,
+                safe_gate=safe_gate, lower_bound=lower_bound,
+            )
+            for name in names:
+                if name not in outputs:
+                    full_shape = list(part[name].shape)
+                    full_shape[1] = q.shape[1]
+                    outputs[name] = torch.empty(full_shape, device=part[name].device, dtype=part[name].dtype)
+                outputs[name][:, start:end] = part[name]
+        return outputs
+
+    cu = None
     if use_gate:
         gk = kda_gate_chunk_cumsum(
             g=g,
@@ -244,14 +300,17 @@ def run_fla(
             scale=FLA_RCP_LN2,
             chunk_size=chunk_size,
             lower_bound=lower_bound if safe_gate else None,
+            cu_seqlens=cu,
         )
     else:
         gk = chunk_local_cumsum(
             g=g,
             scale=FLA_RCP_LN2,
             chunk_size=chunk_size,
+            cu_seqlens=cu,
         )
     w, u, qg, kg = recompute_w_u_fwd(
         q=q, k=k, v=v, beta=beta, A=A, gk=gk,
+        cu_seqlens=cu,
     )
     return {"gk": gk, "qg": qg, "kg": kg, "w": w, "u": u}

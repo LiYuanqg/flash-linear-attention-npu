@@ -19,7 +19,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from common import RCP_LN2, RCP_LN2_F64, expand_hk_to_hv
+from common import RCP_LN2, RCP_LN2_F64, expand_hk_to_hv, iter_chunks
 
 
 def activate_gate(
@@ -43,12 +43,16 @@ def activate_gate(
     return -eig * F.softplus(x)
 
 
-def chunk_cumsum(gate: torch.Tensor, chunk_size: int, scale: float) -> torch.Tensor:
+def chunk_cumsum(
+    gate: torch.Tensor,
+    chunk_size: int,
+    scale: float,
+    cu_seqlens: list[int] | None = None,
+) -> torch.Tensor:
     """Chunk-local prefix sum along T. gate/gk are [B, HV, T, K]."""
-    batch, hv, tokens, k_dim = gate.shape
     gk = torch.empty_like(gate)
-    for start in range(0, tokens, chunk_size):
-        end = min(start + chunk_size, tokens)
+    tokens = gate.shape[2]
+    for start, end in iter_chunks(tokens, chunk_size, cu_seqlens):
         gk[:, :, start:end] = torch.cumsum(gate[:, :, start:end], dim=2) * scale
     return gk
 
@@ -67,6 +71,7 @@ def stage_v0(
     safe_gate: bool,
     lower_bound: float,
     rcp_ln2: float | None = None,
+    cu_seqlens: list[int] | None = None,
 ) -> dict[str, torch.Tensor]:
     """V0: safe-gate correct g, then kda_gate_chunk_cumsum(g_corr), then qg/kbg/vb/kg.
 
@@ -93,7 +98,7 @@ def stage_v0(
         g, A_log, dt_bias,
         use_gate=use_gate, safe_gate=safe_gate, lower_bound=lower_bound,
     )
-    gk = chunk_cumsum(g_corr, chunk_size, scale)
+    gk = chunk_cumsum(g_corr, chunk_size, scale, cu_seqlens=cu_seqlens)
     e2 = torch.exp2(gk)
 
     q_hv = expand_hk_to_hv(q, hv)
@@ -105,8 +110,7 @@ def stage_v0(
     vb = v * beta_k
 
     kg = torch.empty_like(k_hv)
-    for start in range(0, tokens, chunk_size):
-        end = min(start + chunk_size, tokens)
+    for start, end in iter_chunks(tokens, chunk_size, cu_seqlens):
         gk_last = gk[:, :, end - 1 : end, :]
         kg[:, :, start:end] = k_hv[:, :, start:end] * torch.exp2(gk_last - gk[:, :, start:end])
 
@@ -119,10 +123,12 @@ def stage_c0(
     vb: torch.Tensor,
     *,
     chunk_size: int,
+    cu_seqlens: list[int] | None = None,
 ) -> dict[str, torch.Tensor]:
     """C0: u = A @ vb, w = A @ kbg. A is sequence-major [B, T, HV, BT].
 
     kbg is [B, HV, T, K], vb is [B, HV, T, V]. Outputs are head-first.
+    Leftover and varlen chunks use length×length, equivalent to BT×BT with padded time rows = 0.
     """
     batch, hv, tokens, k_dim = kbg.shape
     v_dim = vb.shape[-1]
@@ -130,14 +136,11 @@ def stage_c0(
     A = A.to(work_dtype)
     w = torch.empty((batch, hv, tokens, k_dim), dtype=work_dtype, device=kbg.device)
     u = torch.empty((batch, hv, tokens, v_dim), dtype=work_dtype, device=vb.device)
-    for batch_id in range(batch):
-        for hv_id in range(hv):
-            for start in range(0, tokens, chunk_size):
-                end = min(start + chunk_size, tokens)
-                length = end - start
-                a = A[batch_id, start:end, hv_id, :length]
-                w[batch_id, hv_id, start:end] = a @ kbg[batch_id, hv_id, start:end]
-                u[batch_id, hv_id, start:end] = a @ vb[batch_id, hv_id, start:end]
+    for start, end in iter_chunks(tokens, chunk_size, cu_seqlens):
+        length = end - start
+        a = A[:, start:end, :, :length].permute(0, 2, 1, 3).contiguous()
+        w[:, :, start:end] = torch.matmul(a, kbg[:, :, start:end])
+        u[:, :, start:end] = torch.matmul(a, vb[:, :, start:end])
     return {"w": w, "u": u}
 
 
@@ -147,5 +150,9 @@ def fused_cpu(inputs: dict[str, torch.Tensor], **v0_kwargs) -> dict[str, torch.T
         inputs["A_log"], inputs.get("dt_bias"),
         **v0_kwargs,
     )
-    c0 = stage_c0(inputs["A"], v0["kbg"], v0["vb"], chunk_size=v0_kwargs["chunk_size"])
+    c0 = stage_c0(
+        inputs["A"], v0["kbg"], v0["vb"],
+        chunk_size=v0_kwargs["chunk_size"],
+        cu_seqlens=v0_kwargs.get("cu_seqlens"),
+    )
     return {**v0, **c0}
