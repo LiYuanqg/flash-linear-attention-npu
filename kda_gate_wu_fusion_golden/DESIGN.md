@@ -1,6 +1,6 @@
 # KDA `kda_gate_chunk_cumsum` + `recompute_w_u_fwd` 融合设计
 
-本文是融合 L0 的实现前设计，不是已发布 ABI。公开接口仍是 `aclnnKdaGateCumsum` 与 `aclnnRecomputeWUFwd`；本融合是新的私有 L0，落地前需 `@weinachuan` 确认。仓内 GDN 的 `RecomputeWUFwd` 是 scalar-`g` 语义，不能直接拼。
+本文是融合 L0 的实现前设计，不是已发布 ABI。公开接口仍是 `aclnnKdaGateCumsum` 与 `aclnnRecomputeWUFwd`；本融合是新的私有 L0 `ChunkKdaBwdRecompute`，落地前需 `@weinachuan` 确认。仓内 GDN 的 `RecomputeWUFwd` 是 scalar-`g` 语义，不能直接拼。
 
 L0 def / L2 aclnn / Torch 草案见 [INTERFACES.md](INTERFACES.md)。
 
@@ -229,8 +229,8 @@ flag_free [core][slot]
 与 golden 一致，调试简单，不能做 chunk 错拍：
 
 ```text
-kbg : [B, T, H_v, K]  输入 dtype
-vb  : [B, T, H_v, V]  输入 dtype
+kbg : [B, H_v, T, K]  BNSD，输入 dtype
+vb  : [B, H_v, T, V]  BNSD，输入 dtype
 ```
 
 默认 case `B=1,T=256,H_v=4,K=V=128,BF16`：各 256 KiB，合计 **512 KiB**。性能路径应换成 6.1。

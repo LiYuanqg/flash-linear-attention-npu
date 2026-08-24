@@ -1,4 +1,4 @@
-"""Shared input generation and layout helpers for KDA gate+WU fusion golden."""
+"""Shared input generation helpers for KDA gate+WU fusion golden."""
 
 from __future__ import annotations
 
@@ -103,21 +103,21 @@ def make_akk(
     cu_seqlens: Optional[Iterable[int]] = None,
     fill: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Sequence-major Akk-like matrix: [B, T, HV, BT], lower-triangular + I per chunk.
+    """Head-first Akk: dense BNSD `[B, HV, T, BT]`. Lower-triangular + I per chunk.
 
     Leftover tails shorter than `chunk_size` only fill `A[..., :length]`. Extra columns
     stay 0 so C0's BT×BT dot (padded time rows = 0) matches the length×length matmul.
     """
-    akk = torch.zeros((batch, tokens, hv, chunk_size), dtype=dtype, device=device)
+    akk = torch.zeros((batch, hv, tokens, chunk_size), dtype=dtype, device=device)
     if fill is None:
-        fill = uniform((batch, tokens, hv, chunk_size), dtype=dtype, device=device)
+        fill = uniform((batch, hv, tokens, chunk_size), dtype=dtype, device=device)
     for start, end in iter_chunks(tokens, chunk_size, cu_seqlens):
         length = end - start
         lower = torch.tril(torch.ones(length, length, dtype=dtype, device=device))
         eye = torch.eye(length, dtype=dtype, device=device)
-        block = fill[:, start:end, :, :length]
-        akk[:, start:end, :, :length] = (
-            block * lower.view(1, length, 1, length) + eye.view(1, length, 1, length)
+        block = fill[:, :, start:end, :length]
+        akk[:, :, start:end, :length] = (
+            block * lower.view(1, 1, length, length) + eye.view(1, 1, length, length)
         )
     return akk
 
@@ -137,15 +137,15 @@ def make_inputs(
     cu_seqlens: Optional[Iterable[int]] = None,
     input_ranges: Optional[dict[str, str]] = None,
 ) -> dict[str, torch.Tensor]:
-    """Generate head-first tensors with a fixed RNG stream.
+    """Generate head-first BNSD tensors with a fixed RNG stream.
 
     q/k: [B, HK, T, K]
     v:   [B, HV, T, V]
     g:   [B, HV, T, K]  (key-wise)
     beta:[B, HV, T]
+    A:   [B, HV, T, BT]
     A_log: [HV]
     dt_bias: [HV, K]
-    A: [B, T, HV, BT] sequence-major, matching FLA recompute_w_u_fwd
 
     Default fill is uniform(-1, 1). Case JSON uses `input_ranges` with normal().
     Leftover T and varlen `cu_seqlens` are allowed; T need not be a multiple of chunk_size.
@@ -174,13 +174,13 @@ def make_inputs(
     tensors["A"] = make_akk(
         batch, tokens, hv, chunk_size, dtype, device,
         cu_seqlens=cu_seqlens,
-        fill=fill((batch, tokens, hv, chunk_size), "q_k_v", dtype),
+        fill=fill((batch, hv, tokens, chunk_size), "q_k_v", dtype),
     )
     return tensors
 
 
 def head_to_seq(tensor: torch.Tensor) -> torch.Tensor:
-    """[B, H, T, ...] -> [B, T, H, ...]. Rank-3 beta: [B, H, T] -> [B, T, H]."""
+    """BNSD `[B, H, T, ...]` -> BSND `[B, T, H, ...]`. Rank-3 beta: `[B, H, T]` -> `[B, T, H]`."""
     if tensor.ndim == 4:
         return tensor.permute(0, 2, 1, 3).contiguous()
     if tensor.ndim == 3:

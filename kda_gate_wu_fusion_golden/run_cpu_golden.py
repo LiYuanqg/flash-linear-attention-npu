@@ -1,4 +1,4 @@
-"""Run CPU V0 -> C0 golden and save sequence-major tensors."""
+"""Run CPU V0 -> C0 golden and save head-first BNSD tensors."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from common import head_to_seq, make_inputs, parse_dtype, save_tensor
+from common import make_inputs, parse_dtype, save_tensor
 from kda_gate_wu_golden import fused_cpu
 
 OUTPUT_NAMES = ("g_corr", "gk", "qg", "kbg", "vb", "kg", "w", "u")
@@ -69,10 +69,10 @@ def main() -> None:
     if args.save_inputs:
         input_dir = args.out_dir / "inputs"
         for name, value in inputs.items():
-            save_tensor(input_dir / f"{name}.pt", head_to_seq(value) if name != "A" else value)
+            save_tensor(input_dir / f"{name}.pt", value)
 
     for name in OUTPUT_NAMES:
-        save_tensor(args.out_dir / f"{name}.pt", head_to_seq(outputs[name]))
+        save_tensor(args.out_dir / f"{name}.pt", outputs[name])
 
     print(
         f"cpu golden compute_precision={args.compute_precision} "

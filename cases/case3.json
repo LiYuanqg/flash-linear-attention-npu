@@ -21,7 +21,6 @@
         "state_v_first": true,
         "use_gate_in_kernel": true,
         "l2_epsilon": 1e-06,
-        "layout": "BSND",
         "case_id": "case_03",
         "dtype": "bfloat16",
         "seed": 20260826,

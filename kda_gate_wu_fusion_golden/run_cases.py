@@ -3,22 +3,96 @@
 from __future__ import annotations
 
 import argparse
+import gc
+import os
+import subprocess
 import sys
 from pathlib import Path
 
 import torch
 
-from common import head_to_seq, load_case, make_inputs, parse_dtype
+from common import head_to_seq, load_case, make_inputs, parse_dtype, save_tensor
 from compare_stats import stats
 from kda_gate_wu_golden import fused_cpu
 
 STAGED_NAMES = ("g_corr", "gk", "qg", "kbg", "vb", "kg", "w", "u")
 FLA_NAMES = ("gk", "qg", "kg", "w", "u")
+VIZ_ELEMS = 100_000
+
+
+def _find_ct() -> str | None:
+    env = os.environ.get("CT")
+    if env and Path(env).exists():
+        return env
+    for candidate in (Path.home() / ".venvs/fla/bin/ct", Path.home() / ".local/bin/ct"):
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def _subsample_pair(real: torch.Tensor, expect: torch.Tensor, *, n: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
+    real_1d = real.detach().reshape(-1).cpu()
+    expect_1d = expect.detach().reshape(-1).cpu()
+    if real_1d.numel() != expect_1d.numel():
+        raise ValueError(f"numel mismatch: {real_1d.numel()} vs {expect_1d.numel()}")
+    count = min(n, real_1d.numel())
+    if real_1d.numel() == count:
+        return real_1d.contiguous(), expect_1d.contiguous()
+    generator = torch.Generator().manual_seed(seed)
+    index = torch.randperm(real_1d.numel(), generator=generator)[:count]
+    return real_1d[index].contiguous(), expect_1d[index].contiguous()
+
+
+def _dump_pair(
+    real: dict[str, torch.Tensor],
+    expect: dict[str, torch.Tensor],
+    names: tuple[str, ...],
+    real_dir: Path,
+    expect_dir: Path,
+    *,
+    seed: int,
+) -> None:
+    for offset, name in enumerate(names):
+        if name not in real or name not in expect:
+            continue
+        real_s, expect_s = _subsample_pair(real[name], expect[name], n=VIZ_ELEMS, seed=seed + offset)
+        save_tensor(real_dir / f"{name}.pt", real_s)
+        save_tensor(expect_dir / f"{name}.pt", expect_s)
+
+
+def _ct_viz(cpu_dir: Path, tri_dir: Path, out_dir: Path, names: tuple[str, ...]) -> None:
+    ct = _find_ct()
+    if ct is None:
+        print("skip ct viz: ct binary not found", flush=True)
+        return
+    os.environ.setdefault("MPLBACKEND", "Agg")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        cpu = cpu_dir / f"{name}.pt"
+        tri = tri_dir / f"{name}.pt"
+        if not cpu.exists() or not tri.exists():
+            print(f"skip ct viz {name}: missing dump", flush=True)
+            continue
+        print(f"ct viz {name} -> {out_dir}", flush=True)
+        subprocess.run(
+            [ct, "viz", str(cpu), str(tri), "--out_dir", str(out_dir), "--name", name, "-sc", str(VIZ_ELEMS), "-wl", "1"],
+            check=True,
+        )
+
+
+def _viz_dirs(dump_dir: Path) -> dict[str, Path]:
+    return {
+        "cpu": dump_dir / "cpu_fp32",
+        "staged": dump_dir / "triton_staged",
+        "fla": dump_dir / "triton_fla",
+        "ct_staged": dump_dir / "ct_staged",
+        "ct_fla": dump_dir / "ct_fla",
+    }
 
 
 def _to_seq(inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     return {
-        name: value if name in {"A", "A_log", "dt_bias"} else head_to_seq(value)
+        name: value if name in {"A_log", "dt_bias"} else head_to_seq(value)
         for name, value in inputs.items()
     }
 
@@ -44,7 +118,7 @@ def _slice_seq_inputs(seq: dict[str, torch.Tensor], start: int, end: int) -> dic
         if name in {"A_log", "dt_bias"}:
             out[name] = value
         else:
-            out[name] = value[:, start:end]
+            out[name] = value[:, :, start:end] if value.ndim >= 3 else value[:, start:end]
     return out
 
 
@@ -116,14 +190,15 @@ def _run_pair(runner, seq, kwargs, cpu_seq, names, cu, device):
             part_in["q"], part_in["k"], part_in["v"], part_in["g"], part_in["beta"],
             part_in["A"], part_in["A_log"], part_in["dt_bias"], **dense_kwargs,
         )
-        cpu_part = {name: cpu_seq[name][:, start:end] for name in names if name in cpu_seq}
+        cpu_part = {name: cpu_seq[name][:, :, start:end] if cpu_seq[name].ndim >= 3 else cpu_seq[name][:, start:end]
+                    for name in names if name in cpu_seq}
         _merge_rows(acc, _compare(cpu_part, got, names), (end - start))
         del got, part_in
         torch.cuda.empty_cache()
     return _finalize_rows(acc), None
 
 
-def _run_one_dense(inputs, case, device, skip_fla, lines):
+def _run_one_dense(inputs, case, device, skip_fla, lines, dump_dir: Path | None):
     work = {name: value.to(torch.float32) for name, value in inputs.items()}
     cpu = fused_cpu(
         work,
@@ -133,8 +208,7 @@ def _run_one_dense(inputs, case, device, skip_fla, lines):
         lower_bound=case["lower_bound"],
         cu_seqlens=None,
     )
-    cpu_seq = {name: head_to_seq(value) for name, value in cpu.items()}
-    del work, cpu
+    del work
     if device.type != "cuda":
         print("skip GPU: CUDA not available")
         lines.append("GPU skipped")
@@ -142,8 +216,7 @@ def _run_one_dense(inputs, case, device, skip_fla, lines):
 
     from triton_kernels import run_fla, run_staged
 
-    seq = _move(_to_seq(inputs), device)
-    del inputs
+    dirs = _viz_dirs(dump_dir) if dump_dir is not None else None
     kwargs = dict(
         chunk_size=case["chunk_size"],
         use_gate=case["use_gate"],
@@ -151,20 +224,40 @@ def _run_one_dense(inputs, case, device, skip_fla, lines):
         lower_bound=case["lower_bound"],
         cu_seqlens=None,
     )
-    staged_rows, staged = _run_pair(run_staged, seq, kwargs, cpu_seq, STAGED_NAMES, None, device)
+    bnsd = _move(inputs, device)
+    staged_rows, staged = _run_pair(run_staged, bnsd, kwargs, cpu, STAGED_NAMES, None, device)
     _append_rows(lines, "CPU FP32 vs staged Triton", staged_rows)
-    if skip_fla:
-        return "\n".join(lines) + "\n"
-    fla_rows, fla = _run_pair(run_fla, seq, kwargs, cpu_seq, FLA_NAMES, None, device)
-    _append_rows(lines, "CPU FP32 vs FLA kda_gate_chunk_cumsum+recompute_w_u_fwd", fla_rows)
-    if staged is not None and fla is not None:
-        _append_rows(lines, "staged Triton vs FLA", _compare(staged, fla, FLA_NAMES))
-    del staged, fla, seq, cpu_seq
+    if dirs is not None and staged is not None:
+        _dump_pair(cpu, staged, STAGED_NAMES, dirs["cpu"], dirs["staged"], seed=case["seed"])
+    del staged, bnsd
     torch.cuda.empty_cache()
+    gc.collect()
+
+    if not skip_fla:
+        cpu_seq = {name: head_to_seq(cpu[name]) for name in FLA_NAMES}
+        del cpu
+        gc.collect()
+        seq = _move(_to_seq(inputs), device)
+        fla_rows, fla = _run_pair(run_fla, seq, kwargs, cpu_seq, FLA_NAMES, None, device)
+        _append_rows(lines, "CPU FP32 vs FLA kda_gate_chunk_cumsum+recompute_w_u_fwd", fla_rows)
+        if dirs is not None and fla is not None:
+            _dump_pair(cpu_seq, fla, FLA_NAMES, dirs["cpu"] / "fla_view", dirs["fla"], seed=case["seed"] + 17)
+        del fla, seq, cpu_seq
+        torch.cuda.empty_cache()
+        gc.collect()
+    else:
+        del cpu
+
+    del inputs
+    gc.collect()
+    if dirs is not None:
+        _ct_viz(dirs["cpu"], dirs["staged"], dirs["ct_staged"], STAGED_NAMES)
+        if not skip_fla:
+            _ct_viz(dirs["cpu"] / "fla_view", dirs["fla"], dirs["ct_fla"], FLA_NAMES)
     return "\n".join(lines) + "\n"
 
 
-def _run_one_varlen(case, device, skip_fla, lines):
+def _run_one_varlen(case, device, skip_fla, lines, dump_dir: Path | None):
     """Per-sequence to keep peak memory at max(seq_len), not packed T."""
     cu = case["cu_seqlens"]
     if device.type != "cuda":
@@ -177,6 +270,10 @@ def _run_one_varlen(case, device, skip_fla, lines):
     staged_acc: dict[str, dict] = {}
     fla_acc: dict[str, dict] = {}
     vs_acc: dict[str, dict] = {}
+    staged_real_parts = {name: [] for name in STAGED_NAMES}
+    staged_expect_parts = {name: [] for name in STAGED_NAMES}
+    fla_real_parts = {name: [] for name in FLA_NAMES}
+    fla_expect_parts = {name: [] for name in FLA_NAMES}
     kwargs = dict(
         chunk_size=case["chunk_size"],
         use_gate=case["use_gate"],
@@ -185,6 +282,7 @@ def _run_one_varlen(case, device, skip_fla, lines):
         cu_seqlens=None,
     )
     n_seq = 0
+    tokens = case["tokens"]
     for seq_id, (start, end) in enumerate(zip(cu[:-1], cu[1:])):
         length = end - start
         if length <= 0:
@@ -212,23 +310,40 @@ def _run_one_varlen(case, device, skip_fla, lines):
             lower_bound=case["lower_bound"],
         )
         cpu_seq = {name: head_to_seq(value) for name, value in cpu.items()}
-        del work, cpu
+        del work
+        bnsd = _move(inputs, device)
         seq = _move(_to_seq(inputs), device)
         del inputs
         staged = run_staged(
-            seq["q"], seq["k"], seq["v"], seq["g"], seq["beta"], seq["A"],
-            seq["A_log"], seq["dt_bias"], **kwargs,
+            bnsd["q"], bnsd["k"], bnsd["v"], bnsd["g"], bnsd["beta"], bnsd["A"],
+            bnsd["A_log"], bnsd["dt_bias"], **kwargs,
         )
-        _merge_rows(staged_acc, _compare(cpu_seq, staged, STAGED_NAMES), length)
+        _merge_rows(staged_acc, _compare(cpu, staged, STAGED_NAMES), length)
+        n_sample = max(256, int(VIZ_ELEMS * length / max(tokens, 1)))
+        if dump_dir is not None:
+            for offset, name in enumerate(STAGED_NAMES):
+                real_s, expect_s = _subsample_pair(
+                    cpu[name], staged[name], n=n_sample, seed=case["seed"] + seq_id * 32 + offset,
+                )
+                staged_real_parts[name].append(real_s)
+                staged_expect_parts[name].append(expect_s)
         if not skip_fla:
             fla = run_fla(
                 seq["q"], seq["k"], seq["v"], seq["g"], seq["beta"], seq["A"],
                 seq["A_log"], seq["dt_bias"], **kwargs,
             )
             _merge_rows(fla_acc, _compare(cpu_seq, fla, FLA_NAMES), length)
-            _merge_rows(vs_acc, _compare(staged, fla, FLA_NAMES), length)
+            staged_seq = {name: head_to_seq(staged[name]) for name in FLA_NAMES}
+            _merge_rows(vs_acc, _compare(staged_seq, fla, FLA_NAMES), length)
+            if dump_dir is not None:
+                for offset, name in enumerate(FLA_NAMES):
+                    real_s, expect_s = _subsample_pair(
+                        cpu_seq[name], fla[name], n=n_sample, seed=case["seed"] + 17 + seq_id * 32 + offset,
+                    )
+                    fla_real_parts[name].append(real_s)
+                    fla_expect_parts[name].append(expect_s)
             del fla
-        del staged, seq, cpu_seq
+        del staged, bnsd, seq, cpu, cpu_seq
         torch.cuda.empty_cache()
         if seq_id % 8 == 0:
             print(f"  varlen seq {seq_id}/{len(cu)-1} len={length}", flush=True)
@@ -238,10 +353,28 @@ def _run_one_varlen(case, device, skip_fla, lines):
     if not skip_fla:
         _append_rows(lines, "CPU FP32 vs FLA kda_gate_chunk_cumsum+recompute_w_u_fwd", _finalize_rows(fla_acc))
         _append_rows(lines, "staged Triton vs FLA", _finalize_rows(vs_acc))
+    if dump_dir is not None:
+        dirs = _viz_dirs(dump_dir)
+
+        def _cat_trim(parts: list[torch.Tensor]) -> torch.Tensor:
+            cat = torch.cat(parts)
+            return cat[:VIZ_ELEMS].contiguous()
+
+        for name in STAGED_NAMES:
+            if staged_real_parts[name]:
+                save_tensor(dirs["cpu"] / f"{name}.pt", _cat_trim(staged_real_parts[name]))
+                save_tensor(dirs["staged"] / f"{name}.pt", _cat_trim(staged_expect_parts[name]))
+        _ct_viz(dirs["cpu"], dirs["staged"], dirs["ct_staged"], STAGED_NAMES)
+        if not skip_fla:
+            for name in FLA_NAMES:
+                if fla_real_parts[name]:
+                    save_tensor(dirs["cpu"] / "fla_view" / f"{name}.pt", _cat_trim(fla_real_parts[name]))
+                    save_tensor(dirs["fla"] / f"{name}.pt", _cat_trim(fla_expect_parts[name]))
+            _ct_viz(dirs["cpu"] / "fla_view", dirs["fla"], dirs["ct_fla"], FLA_NAMES)
     return "\n".join(lines) + "\n"
 
 
-def run_one(case_path: Path, *, device: torch.device, skip_fla: bool) -> str:
+def run_one(case_path: Path, *, device: torch.device, skip_fla: bool, dump_dir: Path | None) -> str:
     case = load_case(case_path)
     cu = case["cu_seqlens"]
     print(
@@ -252,7 +385,7 @@ def run_one(case_path: Path, *, device: torch.device, skip_fla: bool) -> str:
     )
     lines = [f"# {case['case_id']}"]
     if cu:
-        return _run_one_varlen(case, device, skip_fla, lines)
+        return _run_one_varlen(case, device, skip_fla, lines, dump_dir)
 
     inputs = make_inputs(
         batch=case["batch"],
@@ -267,7 +400,7 @@ def run_one(case_path: Path, *, device: torch.device, skip_fla: bool) -> str:
         cu_seqlens=None,
         input_ranges=case["input_ranges"],
     )
-    return _run_one_dense(inputs, case, device, skip_fla, lines)
+    return _run_one_dense(inputs, case, device, skip_fla, lines, dump_dir)
 
 
 def _default_cases_dir() -> Path:
@@ -284,6 +417,7 @@ def main() -> None:
     parser.add_argument("--out-dir", type=Path, default=Path("outputs/cases"))
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--skip-fla", action="store_true")
+    parser.add_argument("--no-viz", action="store_true", help="stats only, skip ct viz dumps")
     parser.add_argument("--only", nargs="*", default=None, help="case stems, e.g. case0 case3")
     args = parser.parse_args()
 
@@ -303,7 +437,8 @@ def main() -> None:
     summaries = []
     for path in paths:
         try:
-            text = run_one(path, device=device, skip_fla=args.skip_fla)
+            dump_dir = None if args.no_viz else (args.out_dir / path.stem)
+            text = run_one(path, device=device, skip_fla=args.skip_fla, dump_dir=dump_dir)
         except Exception as exc:
             text = f"# {path.stem}\nFAILED: {type(exc).__name__}: {exc}\n"
             print(text, flush=True)

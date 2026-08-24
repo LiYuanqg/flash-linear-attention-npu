@@ -53,7 +53,8 @@ def main() -> None:
         dtype=dtype,
         seed=args.seed,
     )
-    seq = {name: (value if name in {"A", "A_log", "dt_bias"} else head_to_seq(value)).to(device)
+    bnsd = {name: value.to(device) for name, value in cpu_inputs.items()}
+    seq = {name: (value if name in {"A_log", "dt_bias"} else head_to_seq(value)).to(device)
            for name, value in cpu_inputs.items()}
 
     kwargs = dict(
@@ -64,8 +65,8 @@ def main() -> None:
     )
     if args.backend == "staged":
         outputs = run_staged(
-            seq["q"], seq["k"], seq["v"], seq["g"], seq["beta"], seq["A"],
-            seq["A_log"], seq["dt_bias"], **kwargs,
+            bnsd["q"], bnsd["k"], bnsd["v"], bnsd["g"], bnsd["beta"], bnsd["A"],
+            bnsd["A_log"], bnsd["dt_bias"], **kwargs,
         )
         names = STAGED_NAMES
     else:
@@ -78,7 +79,7 @@ def main() -> None:
     if args.save_inputs:
         input_dir = args.out_dir / "inputs"
         for name, value in cpu_inputs.items():
-            save_tensor(input_dir / f"{name}.pt", value if name in {"A", "A_log", "dt_bias"} else head_to_seq(value))
+            save_tensor(input_dir / f"{name}.pt", value)
 
     for name in names:
         save_tensor(args.out_dir / f"{name}.pt", outputs[name])

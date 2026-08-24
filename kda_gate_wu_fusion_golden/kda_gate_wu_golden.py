@@ -125,9 +125,9 @@ def stage_c0(
     chunk_size: int,
     cu_seqlens: list[int] | None = None,
 ) -> dict[str, torch.Tensor]:
-    """C0: u = A @ vb, w = A @ kbg. A is sequence-major [B, T, HV, BT].
+    """C0: u = A @ vb, w = A @ kbg. All tensors are BNSD.
 
-    kbg is [B, HV, T, K], vb is [B, HV, T, V]. Outputs are head-first.
+    A is `[B, HV, T, BT]`, kbg is `[B, HV, T, K]`, vb is `[B, HV, T, V]`.
     Leftover and varlen chunks use length×length, equivalent to BT×BT with padded time rows = 0.
     """
     batch, hv, tokens, k_dim = kbg.shape
@@ -138,7 +138,7 @@ def stage_c0(
     u = torch.empty((batch, hv, tokens, v_dim), dtype=work_dtype, device=vb.device)
     for start, end in iter_chunks(tokens, chunk_size, cu_seqlens):
         length = end - start
-        a = A[:, start:end, :, :length].permute(0, 2, 1, 3).contiguous()
+        a = A[:, :, start:end, :length]
         w[:, :, start:end] = torch.matmul(a, kbg[:, :, start:end])
         u[:, :, start:end] = torch.matmul(a, vb[:, :, start:end])
     return {"w": w, "u": u}
