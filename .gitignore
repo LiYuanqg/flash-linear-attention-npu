@@ -74,3 +74,5 @@ examples/fast_kernel_launch_example/ascend_ops.egg-info
 examples/fast_kernel_launch_example/build/
 examples/fast_kernel_launch_example/dist
 .history/
+
+*.pt

@@ -1,0 +1,2 @@
+name           abs_mean      abs_max     rel_mean      rel_p99       cosine finite
+h            9.8767e-02   5.9949e-01   1.0650e-02   1.9979e-02   0.99999976 True/True

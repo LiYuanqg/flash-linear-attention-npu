@@ -1,0 +1,9 @@
+name         abs_mean      abs_max     rel_mean      rel_p99       cosine finite
+g_corr   SKIP
+gk         0.0000e+00   0.0000e+00   0.0000e+00   0.0000e+00   1.00000072 True/True
+qg         0.0000e+00   0.0000e+00   0.0000e+00   0.0000e+00   1.00000107 True/True
+kbg      SKIP
+vb       SKIP
+kg         2.3855e-10   3.0518e-05   2.2315e-07   0.0000e+00   1.00000060 True/True
+w          4.8551e-05   3.9062e-03   4.2398e-03   2.8708e-02   1.00000286 True/True
+u          0.0000e+00   0.0000e+00   0.0000e+00   0.0000e+00   0.99999934 True/True
