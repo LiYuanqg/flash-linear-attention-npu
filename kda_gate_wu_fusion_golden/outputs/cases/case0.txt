@@ -1,22 +1,16 @@
 # case_00
 CPU FP32 vs staged Triton
-g_corr abs_mean=5.8735e-08 abs_max=7.1526e-07 rel_p99=1.9391e-07 cosine=0.96264017
-gk abs_mean=4.8075e-06 abs_max=7.6294e-05 rel_p99=1.7818e-07 cosine=1.01528561
-qg abs_mean=1.5860e-07 abs_max=1.2193e-04 rel_p99=2.3225e-03 cosine=1.00046635
-kbg abs_mean=1.2604e-07 abs_max=2.4302e-04 rel_p99=2.2807e-03 cosine=1.00049317
-vb abs_mean=8.7456e-05 abs_max=3.8452e-03 rel_p99=3.4479e-03 cosine=1.02137876
-kg abs_mean=1.5825e-07 abs_max=1.2194e-04 rel_p99=2.3238e-03 cosine=1.00035822
-w abs_mean=9.7114e-07 abs_max=4.8535e-04 rel_p99=1.6591e-02 cosine=1.02025354
-u abs_mean=1.6639e-04 abs_max=7.3007e-03 rel_p99=6.5973e-02 cosine=1.02320290
+g_corr abs_mean=5.8735e-08 abs_max=7.1526e-07 rel_p99=1.9391e-07 cosine=0.96213830
+gk abs_mean=4.8075e-06 abs_max=7.6294e-05 rel_p99=1.7818e-07 cosine=1.01534522
+qg abs_mean=1.5860e-07 abs_max=1.2193e-04 rel_p99=2.3225e-03 cosine=1.00046492
+kbg abs_mean=1.2604e-07 abs_max=2.4302e-04 rel_p99=2.2807e-03 cosine=1.00049198
+vb abs_mean=8.7456e-05 abs_max=3.8452e-03 rel_p99=3.4479e-03 cosine=1.02139997
+kg abs_mean=1.5825e-07 abs_max=1.2194e-04 rel_p99=2.3238e-03 cosine=1.00036073
+w abs_mean=9.7102e-07 abs_max=4.9346e-04 rel_p99=1.6594e-02 cosine=1.02033913
+u abs_mean=1.6637e-04 abs_max=7.4904e-03 rel_p99=6.5943e-02 cosine=1.02317572
 CPU FP32 vs FLA kda_gate_chunk_cumsum+recompute_w_u_fwd
 gk abs_mean=4.8075e-06 abs_max=7.6294e-05 rel_p99=1.7818e-07 cosine=1.01528561
 qg abs_mean=1.5860e-07 abs_max=1.2193e-04 rel_p99=2.3225e-03 cosine=1.00046635
 kg abs_mean=1.5825e-07 abs_max=1.2194e-04 rel_p99=2.3238e-03 cosine=1.00035822
-w abs_mean=1.1840e-06 abs_max=5.8088e-04 rel_p99=2.3078e-02 cosine=1.02025414
-u abs_mean=1.6639e-04 abs_max=7.3007e-03 rel_p99=6.5973e-02 cosine=1.02320290
-staged Triton vs FLA
-gk abs_mean=0.0000e+00 abs_max=0.0000e+00 rel_p99=0.0000e+00 cosine=1.01528561
-qg abs_mean=0.0000e+00 abs_max=0.0000e+00 rel_p99=0.0000e+00 cosine=1.00040793
-kg abs_mean=2.8160e-10 abs_max=1.2207e-04 rel_p99=0.0000e+00 cosine=1.00036144
-w abs_mean=7.3521e-07 abs_max=9.7656e-04 rel_p99=2.3256e-02 cosine=1.02025616
-u abs_mean=0.0000e+00 abs_max=0.0000e+00 rel_p99=0.0000e+00 cosine=1.02326119
+w abs_mean=1.1838e-06 abs_max=5.2337e-04 rel_p99=2.3085e-02 cosine=1.02024651
+u abs_mean=1.6637e-04 abs_max=7.4904e-03 rel_p99=6.5943e-02 cosine=1.02319086
