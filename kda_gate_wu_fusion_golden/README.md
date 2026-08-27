@@ -9,11 +9,11 @@ Local debug only. Do not copy machine names, accounts, or absolute host paths in
 | V0 | vector | correct `g` → `g_corr`; `gk = chunk_cumsum(g_corr) / ln2`; `qg = q * exp2(gk)`; `kbg = k * β * exp2(gk)`; `vb = v * β`; `kg = k * exp2(gk_last - gk)` |
 | C0 | cube | `u = A @ vb`; `w = A @ kbg` |
 
-`g_corr` is the safe-gate correction: `lower_bound * sigmoid(exp(A_log)*(g+dt_bias))`. Cumsum always runs on `g_corr`, not raw `g`. `kbg/vb` are workspace. Public tensors are `gk, qg, kg, w, u`.
+`g_corr` is the safe-gate correction: `lower_bound * sigmoid(exp(A_log)*(g+dt_bias))`. Cumsum always runs on `g_corr`, not raw `g`. On 950, AIV writes `kbg/vb` to AIC L1 via MTE3. Public tensors are `gk, qg, kg, w, u`.
 
 ## Files
 
-- `DESIGN.md`: stage、UB、L1/L0、workspace 槽位
+- `DESIGN.md`: stage、UB、L1/L0、AIV MTE3→L1 槽位
 - `INTERFACES.md`: L0 def、L2 aclnn、Torch（`fla_npu.ops.ascendc` / yaml / `torch.ops.npu`）草案
 - `kda_gate_wu_golden.py`: CPU V0 / C0
 - `run_cpu_golden.py`: CPU runner

@@ -2,7 +2,7 @@
 
 未落地、未改已发布 ABI。`aclnnKdaGateCumsum`、`aclnnRecomputeWUFwd` 保持原样。本融合是新的私有 L0 + 新 L2，实施前需 `@weinachuan` 确认。
 
-内层（Python ctypes / L2 / L0）一律 head-first：dense `BNSD` `[B,H,T,D]`，varlen `NTD` `[H,T,D]`。没有 permute。`kbg/vb`、tile、core 数、workspace offset 只走 tiling data / user workspace，不进 L0 原型。`g` 修正固定 safe gate，没有 `safe_gate`。
+内层（Python ctypes / L2 / L0）一律 head-first：dense `BNSD` `[B,H,T,D]`，varlen `NTD` `[H,T,D]`。没有 permute。tile、core 数只走 tiling data。950 上 `kbg/vb` 由 AIV MTE3 直写 AIC L1，不进 L0 原型，性能路径不申请 GM user workspace。`g` 修正固定 safe gate，没有 `safe_gate`。
 
 `use_exp2=true`（默认）走 `exp2` 与 `/ln2`；`false` 走自然指数 `exp`，cumsum 不再除 `ln2`。safe gate 里的 `exp(A_log)` 不受此开关影响。
 
@@ -97,7 +97,7 @@ ctypes 实参顺序必须与下面 GetWorkspaceSize 去掉末尾 `workspaceSize`
 | `w` / `qg` / `kg` | 同 `q` | `[B,H_v,T,K]` | `[H_v,T,K]` |
 | `u` | 同 `q` | `[B,H_v,T,V]` | `[H_v,T,V]` |
 
-`g_corr` 不返回。`kbg/vb` 留在 aclnn workspace。
+`g_corr` 不返回。`kbg/vb` 留在 L1（AIV MTE3），不进公开输出。
 
 ```python
 import torch
@@ -178,7 +178,7 @@ L2 职责：
 - 校验并保持 head-first：dense `BNSD`，`cu_seqlens` 非空时 `NTD`；与 L0 一致，不做 permute
 - 校验 `chunkSize == a->GetViewShape()` 最后一维，并写入 L0 `chunk_size`
 - 把 `useGateInKernel` / `useExp2` / `lowerBound` 原样下给 L0
-- 申请 `kbg/vb` user workspace（同样 `BNSD`/`NTD`）；`sysWorkspaceSize` 另计
+- 性能路径：`kbg/vb` 由 AIV MTE3 写入 AIC L1，不申请 GM user workspace；`sysWorkspaceSize` 另计
 
 ctypes 类型表必须逐项对照本原型，禁止只按相邻算子推测。
 
@@ -188,7 +188,7 @@ ctypes 类型表必须逐项对照本原型，禁止只按相邻算子推测。
 
 `op_host/chunk_kda_bwd_recompute_def.cpp`
 
-`chunk_size`、`use_exp2` 是 L0 属性。`H_k/H_v/T/K/V` 仍从 descriptor 读。输入、输出、user workspace 都是 head-first：dense `BNSD`，varlen `NTD`。
+`chunk_size`、`use_exp2` 是 L0 属性。`H_k/H_v/T/K/V` 仍从 descriptor 读。输入、输出都是 head-first：dense `BNSD`，varlen `NTD`。
 
 ```cpp
 class ChunkKdaBwdRecompute : public OpDef {
@@ -262,7 +262,7 @@ public:
 | `qg` | 是 | 同 `q` | `[B,H_v,T,K]` | `[H_v,T,K]` |
 | `kg` | 是 | 同 `q` | `[B,H_v,T,K]` | `[H_v,T,K]` |
 
-不进原型：`g_corr`（UB）、`kbg/vb`（user workspace，dense `[B,H_v,T,K/V]`，varlen `[H_v,T,K/V]`）。
+不进原型：`g_corr`（UB）、`kbg/vb`（L1 双槽，`[BT,K]` / `[BT,V]`，AIV MTE3）。
 
 ### 属性
 
