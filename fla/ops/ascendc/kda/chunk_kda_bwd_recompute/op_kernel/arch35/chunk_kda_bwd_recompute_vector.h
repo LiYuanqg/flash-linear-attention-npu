@@ -72,10 +72,7 @@ public:
         useExp2_ = tiling_->useExp2 != 0;
         hasALog_ = tiling_->hasALog != 0;
         hasDtBias_ = tiling_->hasDtBias != 0;
-        {
-            uint32_t bits = static_cast<uint32_t>(tiling_->lowerBoundBits);
-            memcpy(&lowerBound_, &bits, sizeof(lowerBound_));
-        }
+        lowerBound_ = KdaBwdRecomputeBitsToFloat(static_cast<uint32_t>(tiling_->lowerBoundBits));
         gateScale_ = lowerBound_ * (useExp2_ ? KDA_BWD_RECOMPUTE_RCP_LN2 : 1.0f);
 
         l1Buffer_ = LocalTensor<uint8_t>(TPosition::A1, 0, 512 * 1024);

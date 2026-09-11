@@ -62,10 +62,7 @@ public:
         useExp2_ = tiling_->useExp2 != 0;
         hasALog_ = tiling_->hasALog != 0;
         hasDtBias_ = tiling_->hasDtBias != 0;
-        {
-            uint32_t bits = static_cast<uint32_t>(tiling_->lowerBoundBits);
-            memcpy(&lowerBound_, &bits, sizeof(lowerBound_));
-        }
+        lowerBound_ = KdaBwdRecomputeBitsToFloat(static_cast<uint32_t>(tiling_->lowerBoundBits));
         gateScale_ = lowerBound_ * (useExp2_ ? KDA_BWD_RECOMPUTE_RCP_LN2 : 1.0f);
         kbgBytes_ = B_ * Hv_ * T_ * K_ * sizeof(QkType);
         kbgTensor_.SetGlobalBuffer((__gm__ QkType *)workspace_);

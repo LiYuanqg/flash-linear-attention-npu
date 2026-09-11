@@ -17,6 +17,18 @@ constexpr uint32_t KDA_BWD_RECOMPUTE_BT = 64;
 constexpr uint32_t KDA_BWD_RECOMPUTE_K = 128;
 constexpr uint32_t KDA_BWD_RECOMPUTE_V = 128;
 
+__aicore__ inline float KdaBwdRecomputeBitsToFloat(uint32_t bits)
+{
+    float value = 0.0f;
+    auto *dst = reinterpret_cast<uint8_t *>(&value);
+    const auto *src = reinterpret_cast<const uint8_t *>(&bits);
+    dst[0] = src[0];
+    dst[1] = src[1];
+    dst[2] = src[2];
+    dst[3] = src[3];
+    return value;
+}
+
 __aicore__ inline void KdaBwdRecomputeGetChunkOffset(
     GM_ADDR cu_seqlens, GM_ADDR chunk_indices, uint64_t B, uint64_t H, uint64_t T,
     uint64_t chunkSize, uint32_t loopIdx, uint32_t &bos, uint32_t &eos, int64_t isVariable)
