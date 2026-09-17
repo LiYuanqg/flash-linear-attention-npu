@@ -54,6 +54,7 @@ _ASCENDC_OPS = (
     "npu_chunk_kda_bwd",
     "npu_chunk_kda_bwd_intra",
     "npu_chunk_kda_bwd_recompute",
+    "npu_merge_fwd_bwd_kernel",
     "npu_kda_gate_cumsum",
     "npu_recurrent_kda",
 )
@@ -85,6 +86,7 @@ MUTATED_ARGUMENTS = {
     "npu_recurrent_kda": ("initial_state",),
     "recurrent_gated_delta_rule": ("state",),
     "npu_recurrent_gated_delta_rule": ("state",),
+    "npu_merge_fwd_bwd_kernel": ("out",),
 }
 
 MUTATION_PREDICATES = {
