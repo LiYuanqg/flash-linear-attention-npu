@@ -2,7 +2,11 @@
  * Copyright (c) 2026 Tianjin University, Ltd.
  * Licensed under the BSD 3-Clause License.
  *
- * 910b / 910_93 Mix Cube (dav-2201 / AtlasA2). Ascend950 lives in arch35/.
+ * 910b / 910_93 Mix Cube (dav-2201 / AtlasA2).
+ *
+ * Serial per-head GEMM with Mode-2 handshake (Wait Ready → C0 Fixpipe → Free →
+ * C1 Fixpipe → C1Done). CubeT=FP32; L0C 128 KiB → C0/C1 at 64 KiB stride.
+ * Ascend950 pair-stage path is in arch35/.
  */
 #ifndef MERGE_FWD_BWD_KERNEL_CUBE_H
 #define MERGE_FWD_BWD_KERNEL_CUBE_H
@@ -166,6 +170,7 @@ public:
             }
         }
 
+        AscendC::PipeBarrier<PIPE_ALL>();
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(kEventL1);
         AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(kEventL0A);
         AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(kEventL0B);

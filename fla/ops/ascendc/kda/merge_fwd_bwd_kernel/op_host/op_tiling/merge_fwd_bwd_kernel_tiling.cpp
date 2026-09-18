@@ -163,8 +163,9 @@ ge::graphStatus TilingParse4MergeFwdBwdKernel(gert::TilingParseContext *context)
 {
     auto *compileInfo = context->GetCompiledInfo<MergeFwdBwdKernelCompileInfo>();
     OP_CHECK_NULL_WITH_CONTEXT(context, compileInfo);
-    compileInfo->aicNum = 28;
-    compileInfo->aivNum = 56;
+    // Stub defaults: 950=28/56, 910b≈24/48, 910_93≈20/40. Prefer live platform.
+    compileInfo->aicNum = 24;
+    compileInfo->aivNum = 48;
     auto *platformInfo = context->GetPlatformInfo();
     if (platformInfo != nullptr) {
         const auto platform = platform_ascendc::PlatformAscendC(platformInfo);

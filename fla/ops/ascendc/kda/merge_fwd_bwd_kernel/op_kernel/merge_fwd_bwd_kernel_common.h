@@ -85,8 +85,10 @@ __aicore__ inline uint64_t CScratchElemOff(uint64_t h, int64_t tile, uint32_t us
 }
 
 #if !defined(__CCE_AICORE__) || __CCE_AICORE__ != 310
-// 910b / 910_93 Mix 1:2 uses Mode 0x2. AIC Wait aggregates both AIVs, so the
-// idle subblock must dummy-post the same Ready/Free sequence as the owner.
+// 910b / 910_93 Mix 1:2 Mode 0x2 (same FFTS aggregate as 950). Untemplated
+// CrossCoreWaitFlag defaults to mode 0 (inter-core) and will hang or serialize
+// every AIC — always pass <0x2, PIPE> on both Set and Wait (see chunk_fwd_h
+// arch22). Idle AIV must DummyHandshake the same Ready/Free/C1 sequence.
 constexpr uint8_t kA2CrossCoreMode = 0x2;
 constexpr uint8_t kA2ChunkReadyFlag = 2;
 constexpr uint8_t kA2ChunkFreeFlag = 4;
@@ -96,8 +98,7 @@ template <pipe_t PIPE>
 __aicore__ inline void AivWaitChunkFree(uint16_t t)
 {
     (void)t;
-    (void)static_cast<int>(PIPE);
-    AscendC::CrossCoreWaitFlag(kA2ChunkFreeFlag);
+    AscendC::CrossCoreWaitFlag<kA2CrossCoreMode, PIPE>(kA2ChunkFreeFlag);
 }
 
 template <pipe_t PIPE>
@@ -111,8 +112,7 @@ template <pipe_t PIPE>
 __aicore__ inline void AicWaitChunkReady(uint16_t t)
 {
     (void)t;
-    (void)static_cast<int>(PIPE);
-    AscendC::CrossCoreWaitFlag(kA2ChunkReadyFlag);
+    AscendC::CrossCoreWaitFlag<kA2CrossCoreMode, PIPE>(kA2ChunkReadyFlag);
 }
 
 template <pipe_t PIPE>
@@ -126,8 +126,7 @@ template <pipe_t PIPE>
 __aicore__ inline void AivWaitChunkC1(uint16_t t)
 {
     (void)t;
-    (void)static_cast<int>(PIPE);
-    AscendC::CrossCoreWaitFlag(kA2ChunkC1Flag);
+    AscendC::CrossCoreWaitFlag<kA2CrossCoreMode, PIPE>(kA2ChunkC1Flag);
 }
 
 template <pipe_t PIPE>

@@ -46,7 +46,8 @@ constexpr int64_t kCWarmupTile = 2;
 constexpr int64_t kCWarmupTileL0C0 = 3;
 
 constexpr uint8_t kCrossCoreModeIndep = 0x2;
-// 950 Mix Mode 2 (FFTS): AIC Wait aggregates both AIVs. Flag IDs 0..7.
+// Mix Mode 2 (FFTS): AIC Wait aggregates both AIVs. Flag IDs 0..7.
+// Shared by Ascend950 (arch35 wrappers) and 910b/910_93 (common.h A2 wrappers).
 // One Ready/Free/C1 per rank-step (not per head). Idle AIV DummyHandshake. No +16.
 constexpr uint32_t kAivHeadSlots = 2;
 constexpr uint8_t kChunkReadyFlag = 2;

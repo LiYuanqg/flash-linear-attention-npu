@@ -2,7 +2,12 @@
  * Copyright (c) 2026 Tianjin University, Ltd.
  * Licensed under the BSD 3-Clause License.
  *
- * 910b / 910_93 Mix Vector (dav-2201 / AtlasA2). Ascend950 lives in arch35/.
+ * 910b / 910_93 Mix Vector (dav-2201 / AtlasA2).
+ *
+ * Schedule: serial per-head (AIV0 even / AIV1 odd). Mode-2 FFTS aggregates both
+ * AIVs, so the idle subblock DummyHandshake-matches Ready/Free/C1. Cube A/B are
+ * FP32 via workspace H|M slots (StoreHFp32 / StoreMFp32). Ascend950 pair-stage
+ * overlap lives in arch35/.
  */
 #ifndef MERGE_FWD_BWD_KERNEL_VECTOR_H
 #define MERGE_FWD_BWD_KERNEL_VECTOR_H
@@ -64,6 +69,7 @@ public:
             }
             ProcessHead(coreIdx, subIdx, static_cast<int64_t>(h));
         }
+        PipeBarrier<PIPE_ALL>();
         pipe_->ReleaseEventID<HardEvent::MTE2_V>(mte2ToV_);
         pipe_->ReleaseEventID<HardEvent::V_MTE3>(vToMte3_);
         pipe_->ReleaseEventID<HardEvent::MTE2_MTE3>(mte2ToMte3_);
@@ -180,40 +186,6 @@ private:
         }
     }
 
-    __aicore__ inline void StoreMBf16(int64_t srcRank, int64_t h, GlobalTensor<bfloat16_t> dstGm)
-    {
-        if constexpr (std::is_same<T, float>::value) {
-            LocalTensor<float> src = fp32Buf_.Get<float>();
-            LocalTensor<bfloat16_t> dst = bf16Buf_.Get<bfloat16_t>();
-            CopyStridedToUb(src, srcRank, h, kVDim, kKDim);
-            SetFlag<HardEvent::MTE2_V>(mte2ToV_);
-            WaitFlag<HardEvent::MTE2_V>(mte2ToV_);
-            Cast(dst, src, RoundMode::CAST_RINT, kKkElems);
-            SetFlag<HardEvent::V_MTE3>(vToMte3_);
-            WaitFlag<HardEvent::V_MTE3>(vToMte3_);
-            DataCopy(dstGm, dst, kKkElems);
-        } else {
-            LocalTensor<bfloat16_t> dst = bf16Buf_.Get<bfloat16_t>();
-            CopyStridedToUb(dst.template ReinterpretCast<T>(), srcRank, h, kVDim, kKDim);
-            SetFlag<HardEvent::MTE2_MTE3>(mte2ToMte3_);
-            WaitFlag<HardEvent::MTE2_MTE3>(mte2ToMte3_);
-            DataCopy(dstGm, dst, kKkElems);
-        }
-    }
-
-    __aicore__ inline void StoreHBf16(GM_ADDR head)
-    {
-        LocalTensor<float> hFp32 = fp32Buf_.Get<float>();
-        LocalTensor<bfloat16_t> dst = bf16Buf_.Get<bfloat16_t>();
-        GlobalTensor<bfloat16_t> gmH;
-        gmH.SetGlobalBuffer((__gm__ bfloat16_t *)head);
-        gmH.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
-        Cast(dst, hFp32, RoundMode::CAST_RINT, kKvElems);
-        SetFlag<HardEvent::V_MTE3>(vToMte3_);
-        WaitFlag<HardEvent::V_MTE3>(vToMte3_);
-        DataCopy(gmH, dst, kKvElems);
-    }
-
     __aicore__ inline void StoreUserH(int64_t h)
     {
         LocalTensor<float> hFp32 = fp32Buf_.Get<float>();
@@ -227,27 +199,6 @@ private:
             SetFlag<HardEvent::V_MTE3>(vToMte3_);
             WaitFlag<HardEvent::V_MTE3>(vToMte3_);
             DataCopy(hTensor_[static_cast<uint64_t>(h) * kKvElems], dst, kKvElems);
-        }
-    }
-
-    __aicore__ inline GM_ADDR HeadPtr(int64_t h) const
-    {
-        return h_ + static_cast<uint64_t>(h) * static_cast<uint64_t>(kKvElems) * sizeof(T);
-    }
-
-    __aicore__ inline void LoadCFromGm(LocalTensor<float> dst, GlobalTensor<T> gmC)
-    {
-        gmC.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
-        if constexpr (std::is_same<T, float>::value) {
-            DataCopy(dst, gmC, kTileElems);
-            SetFlag<HardEvent::MTE2_V>(mte2ToV_);
-            WaitFlag<HardEvent::MTE2_V>(mte2ToV_);
-        } else {
-            LocalTensor<T> bf = bf16Buf_.Get<T>(kTileElems);
-            DataCopy(bf, gmC, kTileElems);
-            SetFlag<HardEvent::MTE2_V>(mte2ToV_);
-            WaitFlag<HardEvent::MTE2_V>(mte2ToV_);
-            Cast(dst, bf, RoundMode::CAST_NONE, kTileElems);
         }
     }
 
