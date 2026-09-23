@@ -125,6 +125,10 @@ private:
         PipeBarrier<PIPE_V>();
         Muls(expFp, expFp, KDA_BWD_RECOMPUTE_LN2, n);
         PipeBarrier<PIPE_V>();
+        Mins(expFp, expFp, KdaBwdRecomputeArch35::kExpInputMax, n);
+        PipeBarrier<PIPE_V>();
+        Maxs(expFp, expFp, KdaBwdRecomputeArch35::kExpInputMin, n);
+        PipeBarrier<PIPE_V>();
         Exp(expFp, expFp, n);
         PipeBarrier<PIPE_V>();
         Mul(qFp, qFp, expFp, n);
@@ -158,6 +162,10 @@ private:
         Sub(expFp, expFp, gFp32[0], n);
         PipeBarrier<PIPE_V>();
         Muls(expFp, expFp, KDA_BWD_RECOMPUTE_LN2, n);
+        PipeBarrier<PIPE_V>();
+        Mins(expFp, expFp, KdaBwdRecomputeArch35::kExpInputMax, n);
+        PipeBarrier<PIPE_V>();
+        Maxs(expFp, expFp, KdaBwdRecomputeArch35::kExpInputMin, n);
         PipeBarrier<PIPE_V>();
         Exp(expFp, expFp, n);
         PipeBarrier<PIPE_V>();

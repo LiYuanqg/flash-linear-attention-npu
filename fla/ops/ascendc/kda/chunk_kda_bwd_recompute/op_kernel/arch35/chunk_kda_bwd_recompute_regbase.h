@@ -19,10 +19,8 @@ namespace KdaBwdRecomputeArch35 {
 constexpr float kLn2 = 0.69314718055994530942f;
 constexpr float kExpInputMax = 80.0f * kLn2;
 constexpr float kExpInputMin = -80.0f * kLn2;
-// fp16 Exp saturates beyond ~exp(±11). Pass-2 qg/kg write bf16 so this matches
-// the output dtype; gk cumsum stays fp32 Exp.
-constexpr float kHalfExpInputMax = 11.0f;
-constexpr float kHalfExpInputMin = -11.0f;
+// qg/kg are bf16, but the exp2(gk) / exp2(gk_last-gk) intermediates must stay
+// fp32. fp16 Exp saturates at ~exp(±11) and clips training kg on full chunks.
 
 template <bool HAS_BIAS, bool HAS_ALOG>
 static __simd_vf__ inline void AccumulateSafeGateChunk128Regbase(
@@ -142,19 +140,6 @@ __simd_callee__ inline void StoreGateRegbasePair(
     }
 }
 
-__simd_callee__ inline void ExpPairViaHalf(
-    AscendC::MicroAPI::RegTensor<float> &zeroReg,
-    AscendC::MicroAPI::RegTensor<float> &oneReg,
-    AscendC::MicroAPI::RegTensor<half> &halfReg,
-    AscendC::MicroAPI::MaskReg &floatMask,
-    AscendC::MicroAPI::MaskReg &halfMask)
-{
-    using namespace AscendC::MicroAPI;
-    CastFloat2Half<half>(halfReg, zeroReg, oneReg, floatMask);
-    Exp(halfReg, halfReg, halfMask);
-    CastHalf2Float<half>(zeroReg, oneReg, halfReg, halfMask);
-}
-
 template <typename InputT, typename OutputT, typename GateT, typename BetaT, bool HAS_BIAS, bool HAS_ALOG,
           bool kFixed64 = false>
 static __simd_vf__ inline void FusedRecomputeChunk128Regbase(
@@ -242,8 +227,6 @@ static __simd_vf__ inline void FusedRecomputeChunk128Regbase(
         Adds(lastOneReg, accOneReg, 0.0f, floatMask);
     }
 
-    MaskReg halfMask = CreateMask<half, MaskPattern::ALL>();
-    RegTensor<half> expHalfReg;
     RegTensor<float> betaReg;
     RegTensor<BetaT> betaRawReg;
     RegTensor<float> expZeroReg;
@@ -276,11 +259,12 @@ static __simd_vf__ inline void FusedRecomputeChunk128Regbase(
         LoadGateRegbasePair<InputT>(vZeroReg, vOneReg, v + rowOffset, inputMask, inputReg);
         Muls(expZeroReg, gateZeroReg, kLn2, floatMask);
         Muls(expOneReg, gateOneReg, kLn2, floatMask);
-        Mins(expZeroReg, expZeroReg, kHalfExpInputMax, floatMask);
-        Mins(expOneReg, expOneReg, kHalfExpInputMax, floatMask);
-        Maxs(expZeroReg, expZeroReg, kHalfExpInputMin, floatMask);
-        Maxs(expOneReg, expOneReg, kHalfExpInputMin, floatMask);
-        ExpPairViaHalf(expZeroReg, expOneReg, expHalfReg, floatMask, halfMask);
+        Mins(expZeroReg, expZeroReg, kExpInputMax, floatMask);
+        Mins(expOneReg, expOneReg, kExpInputMax, floatMask);
+        Maxs(expZeroReg, expZeroReg, kExpInputMin, floatMask);
+        Maxs(expOneReg, expOneReg, kExpInputMin, floatMask);
+        Exp(expZeroReg, expZeroReg, floatMask);
+        Exp(expOneReg, expOneReg, floatMask);
 
         Mul(outZeroReg, qZeroReg, expZeroReg, floatMask);
         Mul(outOneReg, qOneReg, expOneReg, floatMask);
@@ -296,11 +280,12 @@ static __simd_vf__ inline void FusedRecomputeChunk128Regbase(
         Sub(deltaOneReg, lastOneReg, gateOneReg, floatMask);
         Muls(deltaZeroReg, deltaZeroReg, kLn2, floatMask);
         Muls(deltaOneReg, deltaOneReg, kLn2, floatMask);
-        Mins(deltaZeroReg, deltaZeroReg, kHalfExpInputMax, floatMask);
-        Mins(deltaOneReg, deltaOneReg, kHalfExpInputMax, floatMask);
-        Maxs(deltaZeroReg, deltaZeroReg, kHalfExpInputMin, floatMask);
-        Maxs(deltaOneReg, deltaOneReg, kHalfExpInputMin, floatMask);
-        ExpPairViaHalf(deltaZeroReg, deltaOneReg, expHalfReg, floatMask, halfMask);
+        Mins(deltaZeroReg, deltaZeroReg, kExpInputMax, floatMask);
+        Mins(deltaOneReg, deltaOneReg, kExpInputMax, floatMask);
+        Maxs(deltaZeroReg, deltaZeroReg, kExpInputMin, floatMask);
+        Maxs(deltaOneReg, deltaOneReg, kExpInputMin, floatMask);
+        Exp(deltaZeroReg, deltaZeroReg, floatMask);
+        Exp(deltaOneReg, deltaOneReg, floatMask);
         Mul(outZeroReg, kZeroReg, deltaZeroReg, floatMask);
         Mul(outOneReg, kOneReg, deltaOneReg, floatMask);
         StoreGateRegbasePair<OutputT>(kg + rowOffset, outZeroReg, outOneReg, inputMask, floatMask, outputReg);

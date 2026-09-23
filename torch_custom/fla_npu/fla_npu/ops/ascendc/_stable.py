@@ -1241,14 +1241,23 @@ def npu_chunk_kda_bwd_recompute(q, k, v, g, beta, a, chunk_size, *,
     so the adapter reorders the results before returning them.
     """
 
-    return _op("npu_chunk_kda_bwd_recompute")(
-        q, k, v, g, beta, a, A_log, dt_bias,
-        _host_ints(cu_seqlens), _host_ints(chunk_indices),
-        chunk_size,
-        True if use_exp2 is None else bool(use_exp2),
-        -5.0 if lower_bound is None else float(lower_bound),
-        bool(use_gate_in_kernel),
-        _current_stream_ptr(),
+    from ._kda_policy import run_kda_recompute_with_tail_guard
+
+    def launch(q_in, k_in, v_in, g_in, beta_in, a_in, cu_in, indices_in):
+        return _op("npu_chunk_kda_bwd_recompute")(
+            q_in, k_in, v_in, g_in, beta_in, a_in, A_log, dt_bias,
+            _host_ints(cu_in), _host_ints(indices_in),
+            chunk_size,
+            True if use_exp2 is None else bool(use_exp2),
+            -5.0 if lower_bound is None else float(lower_bound),
+            bool(use_gate_in_kernel),
+            _current_stream_ptr(),
+        )
+
+    return run_kda_recompute_with_tail_guard(
+        q, k, v, g, beta, a, launch,
+        cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+        chunk_size=int(chunk_size),
     )
 
 
@@ -1740,7 +1749,10 @@ def npu_chunk_kda_bwd(q, k, v, beta, gk, Aqk, Akk, w, qg, kg, v_new, h, d_o,
     if _select_kda_bwd_optimized(
             implementation, q_rstd, k_rstd,
             _optional_bool(disable_recompute, True)):
-        return _kda_bwd_optimized_launch(locals())
+        from ._kda_policy import run_kda_bwd_optimized_with_tail_guard
+
+        return run_kda_bwd_optimized_with_tail_guard(
+            locals(), _kda_bwd_optimized_launch)
 
     chunk_size = int(chunk_size)
     # The flags below are *reserved but not implemented* by this operator.  The

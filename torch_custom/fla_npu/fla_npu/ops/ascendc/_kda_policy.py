@@ -156,3 +156,217 @@ def _prepare_kda_bwd_optimized(args):
 
     args.update(dt_bias=bias, cu_seqlens=cu, chunk_indices=indices)
     return args
+
+
+_KDA_BWD_TOKEN_TENSORS = (
+    "q", "k", "v", "beta", "gk", "Aqk", "Akk", "w", "qg", "kg", "v_new",
+    "d_o", "raw_g", "q_rstd", "k_rstd",
+)
+_KDA_TAIL_GUARD_LOGS = 0
+
+
+def _log_kda_tail_guard(message):
+    global _KDA_TAIL_GUARD_LOGS
+    _KDA_TAIL_GUARD_LOGS += 1
+    if _KDA_TAIL_GUARD_LOGS <= 8:
+        import warnings
+        warnings.warn(message, RuntimeWarning, stacklevel=3)
+
+
+def _kda_host_cu(cu):
+    if cu is None:
+        return None
+    if hasattr(cu, "detach"):
+        cu = cu.detach().cpu().flatten().tolist()
+    return tuple(int(x) for x in cu)
+
+
+def _kda_pad_token_tensor(tensor, token_dim, seqlen, pad_rows, repeat_last=False):
+    import torch
+
+    if tensor is None:
+        return None
+    pad_shape = list(tensor.shape)
+    pad_shape[token_dim] = pad_rows
+    if repeat_last:
+        tail = tensor.narrow(token_dim, seqlen - 1, 1).expand(*pad_shape).clone()
+    else:
+        tail = tensor.new_zeros(pad_shape)
+    return torch.cat((tensor, tail), dim=token_dim).contiguous()
+
+
+def _kda_slice_padded_bwd(outputs, original_seqlen, token_dim):
+    restored = []
+    for index, value in enumerate(outputs):
+        if value is None:
+            restored.append(None)
+            continue
+        if index < 5:
+            value = value.narrow(token_dim, 0, original_seqlen)
+        restored.append(value.contiguous())
+    return tuple(restored)
+
+
+def _kda_combine_split_bwd(results):
+    import torch
+
+    restored = []
+    for output_index in range(8):
+        values = [result[output_index] for result in results]
+        if values[0] is None:
+            restored.append(None)
+        elif output_index < 5:
+            restored.append(torch.cat(
+                [value.squeeze(0) for value in values], dim=1).contiguous())
+        else:
+            total = values[0]
+            for value in values[1:]:
+                total = total + value
+            restored.append(total)
+    return tuple(restored)
+
+
+def run_kda_recompute_with_tail_guard(
+    q, k, v, g, beta, a, launch, *, cu_seqlens=None, chunk_indices=None,
+    chunk_size=64,
+):
+    """Zero-pad leftover T%64 before ChunkKdaBwdRecompute.
+
+    Fused VF extra stores can overwrite leftover rows 0..16. Kernel repair
+    only covers leftover < 16, so training tails of 16-63 stay wrong unless
+    the last chunk is a full 64. Extra gate rows are zeros so leftover
+    gk_last is unchanged. ``launch`` returns ``(gk, w, u, qg, kg)``.
+    """
+    import torch
+
+    cu = _kda_host_cu(cu_seqlens)
+    token_dim = 2
+    seqlen = int(q.shape[token_dim])
+    tensors = {"q": q, "k": k, "v": v, "g": g, "beta": beta, "a": a}
+
+    def _launch(tok, cu_arg, indices_arg):
+        return launch(
+            tok["q"], tok["k"], tok["v"], tok["g"], tok["beta"], tok["a"],
+            cu_arg, indices_arg,
+        )
+
+    def _slice_outputs(outputs, original_seqlen):
+        sliced = []
+        for value in outputs:
+            if value is None:
+                sliced.append(None)
+            else:
+                sliced.append(value.narrow(token_dim, 0, original_seqlen).contiguous())
+        return tuple(sliced)
+
+    has_varlen_tail = cu is not None and any(
+        (end - begin) % chunk_size != 0 for begin, end in zip(cu, cu[1:]))
+    if has_varlen_tail and len(cu) > 2:
+        _log_kda_tail_guard(
+            f"KDA recompute tail-guard split packed leftover cu={cu}"
+        )
+        parts = []
+        for start, end in zip(cu, cu[1:]):
+            seq_len = end - start
+            if seq_len <= 0:
+                continue
+            sub = {
+                name: tensor.narrow(token_dim, start, seq_len).contiguous()
+                for name, tensor in tensors.items()
+            }
+            parts.append(run_kda_recompute_with_tail_guard(
+                sub["q"], sub["k"], sub["v"], sub["g"], sub["beta"], sub["a"],
+                launch, cu_seqlens=None, chunk_indices=None,
+                chunk_size=chunk_size,
+            ))
+        combined = []
+        for output_index in range(5):
+            values = [part[output_index] for part in parts]
+            if values[0] is None:
+                combined.append(None)
+            else:
+                combined.append(torch.cat(values, dim=token_dim).contiguous())
+        return tuple(combined)
+
+    if seqlen % chunk_size != 0 and (cu is None or len(cu) == 2):
+        pad_rows = (
+            (seqlen + chunk_size - 1) // chunk_size
+        ) * chunk_size - seqlen
+        _log_kda_tail_guard(
+            f"KDA recompute tail-guard pad seqlen={seqlen} pad={pad_rows}"
+        )
+        padded = {
+            name: _kda_pad_token_tensor(
+                tensor, token_dim, seqlen, pad_rows, repeat_last=False,
+            )
+            for name, tensor in tensors.items()
+        }
+        padded_cu = None if cu is None else (0, seqlen + pad_rows)
+        return _slice_outputs(
+            _launch(padded, padded_cu, None), seqlen)
+
+    return _launch(tensors, cu, chunk_indices)
+
+
+def run_kda_bwd_optimized_with_tail_guard(args, launch):
+    """Keep V2 C-Intra off leftover rows.
+
+    Packed leftover sequences are split into dense calls; a single leftover
+    chunk is padded to 64 inside the existing last state, then token grads
+    are sliced back.  Full 64-token chunks stay on one launch.
+    """
+    import torch
+
+    args = dict(args)
+    q = args["q"]
+    if q is None:
+        return launch(args)
+    chunk_size = int(args.get("chunk_size") or 64)
+    cu = _kda_host_cu(args.get("cu_seqlens"))
+    packed = cu is not None
+    seqlen = int(q.shape[1] if packed else q.shape[2])
+    token_dim = 1 if packed else 2
+    has_varlen_tail = packed and any(
+        (end - begin) % chunk_size != 0 for begin, end in zip(cu, cu[1:]))
+
+    if has_varlen_tail and len(cu) > 2:
+        _log_kda_tail_guard(f"KDA V2 tail-guard split packed leftover cu={cu}")
+        h_state = args["h"]
+        chunk_begin = 0
+        results = []
+        for start, end in zip(cu, cu[1:]):
+            seq_len = end - start
+            if seq_len <= 0:
+                continue
+            n_chunks = (seq_len + chunk_size - 1) // chunk_size
+            sub = dict(args)
+
+            def dense_slice(tensor):
+                if tensor is None:
+                    return None
+                return tensor.narrow(1, start, seq_len).unsqueeze(0).contiguous()
+
+            for name in _KDA_BWD_TOKEN_TENSORS:
+                sub[name] = dense_slice(args.get(name))
+            sub["h"] = h_state.narrow(0, chunk_begin, n_chunks).unsqueeze(0).contiguous()
+            sub["cu_seqlens"] = None
+            sub["chunk_indices"] = None
+            results.append(run_kda_bwd_optimized_with_tail_guard(sub, launch))
+            chunk_begin += n_chunks
+        return _kda_combine_split_bwd(results)
+
+    if seqlen % chunk_size != 0 and (cu is None or len(cu) == 2):
+        _log_kda_tail_guard(
+            f"KDA V2 tail-guard pad seqlen={seqlen} packed={packed}"
+        )
+        pad_rows = ((seqlen + chunk_size - 1) // chunk_size) * chunk_size - seqlen
+        for name in _KDA_BWD_TOKEN_TENSORS:
+            args[name] = _kda_pad_token_tensor(
+                args.get(name), token_dim, seqlen, pad_rows,
+                repeat_last=(name == "gk"))
+        if cu is not None:
+            args["cu_seqlens"] = (0, seqlen + pad_rows)
+            args["chunk_indices"] = None
+        return _kda_slice_padded_bwd(launch(args), seqlen, token_dim)
+
+    return launch(args)

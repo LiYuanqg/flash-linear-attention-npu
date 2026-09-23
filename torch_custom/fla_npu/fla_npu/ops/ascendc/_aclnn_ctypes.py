@@ -25,6 +25,8 @@ from ._kda_policy import (
     kda_fwd_optional_output_mask,
     _select_kda_bwd_optimized,
     _prepare_kda_bwd_optimized,
+    run_kda_bwd_optimized_with_tail_guard,
+    run_kda_recompute_with_tail_guard,
 )
 from ._runtime import (
     ACL_FORMAT_NCDHW,
@@ -3142,7 +3144,7 @@ def npu_chunk_kda_bwd(
     import torch
 
     if _select_kda_bwd_optimized(implementation, q_rstd, k_rstd, _optional_bool(disable_recompute, True)):
-        return _run_kda_bwd_optimized(locals())
+        return run_kda_bwd_optimized_with_tail_guard(locals(), _run_kda_bwd_optimized)
 
     chunk_size = int(chunk_size)
     if chunk_size != 64:
@@ -4569,37 +4571,44 @@ def npu_chunk_kda_bwd_recompute(
     if use_gate_in_kernel and A_log is None:
         raise RuntimeError("npu_chunk_kda_bwd_recompute: A_log is required when use_gate_in_kernel=True.")
 
-    hv = g.shape[1]
-    gk = _empty((g.shape[0], hv, g.shape[2], 128), g, dtype=torch.float32) if use_gate_in_kernel else None
-    w = _empty((v.shape[0], hv, v.shape[2], 128), v, dtype=torch.bfloat16)
-    u = _empty((v.shape[0], hv, v.shape[2], 128), v, dtype=torch.bfloat16)
-    qg = _empty((g.shape[0], hv, g.shape[2], 128), g, dtype=torch.bfloat16)
-    kg = _empty((g.shape[0], hv, g.shape[2], 128), g, dtype=torch.bfloat16)
+    def launch(q_in, k_in, v_in, g_in, beta_in, a_in, cu_in, indices_in):
+        hv = g_in.shape[1]
+        gk = _empty((g_in.shape[0], hv, g_in.shape[2], 128), g_in, dtype=torch.float32) if use_gate_in_kernel else None
+        w = _empty((v_in.shape[0], hv, v_in.shape[2], 128), v_in, dtype=torch.bfloat16)
+        u = _empty((v_in.shape[0], hv, v_in.shape[2], 128), v_in, dtype=torch.bfloat16)
+        qg = _empty((g_in.shape[0], hv, g_in.shape[2], 128), g_in, dtype=torch.bfloat16)
+        kg = _empty((g_in.shape[0], hv, g_in.shape[2], 128), g_in, dtype=torch.bfloat16)
 
-    def build_args(ctx):
-        return [
-            ctx.tensor(q, "q"),
-            ctx.tensor(k, "k"),
-            ctx.tensor(v, "v"),
-            ctx.tensor(g, "g"),
-            ctx.tensor(beta, "beta"),
-            ctx.tensor(a, "a"),
-            ctx.tensor(A_log, "A_log"),
-            ctx.tensor(dt_bias, "dt_bias"),
-            ctx.int_array(None if cu_seqlens is None else tuple(int(x) for x in cu_seqlens)),
-            ctx.int_array(None if chunk_indices is None else tuple(int(x) for x in chunk_indices)),
-            ctypes.c_int64(int(chunk_size)),
-            ctypes.c_bool(bool(use_exp2)),
-            ctypes.c_double(float(lower_bound)),
-            ctx.tensor(w, "w"),
-            ctx.tensor(u, "u"),
-            ctx.tensor(qg, "qg"),
-            ctx.tensor(kg, "kg"),
-            ctx.tensor(gk, "gk") if gk is not None else ctypes.c_void_p(0),
-        ]
+        def build_args(ctx):
+            return [
+                ctx.tensor(q_in, "q"),
+                ctx.tensor(k_in, "k"),
+                ctx.tensor(v_in, "v"),
+                ctx.tensor(g_in, "g"),
+                ctx.tensor(beta_in, "beta"),
+                ctx.tensor(a_in, "a"),
+                ctx.tensor(A_log, "A_log"),
+                ctx.tensor(dt_bias, "dt_bias"),
+                ctx.int_array(None if cu_in is None else tuple(int(x) for x in cu_in)),
+                ctx.int_array(None if indices_in is None else tuple(int(x) for x in indices_in)),
+                ctypes.c_int64(int(chunk_size)),
+                ctypes.c_bool(bool(use_exp2)),
+                ctypes.c_double(float(lower_bound)),
+                ctx.tensor(w, "w"),
+                ctx.tensor(u, "u"),
+                ctx.tensor(qg, "qg"),
+                ctx.tensor(kg, "kg"),
+                ctx.tensor(gk, "gk") if gk is not None else ctypes.c_void_p(0),
+            ]
 
-    _call_aclnn("aclnnChunkKdaBwdRecompute", build_args, (w, u, qg, kg, gk))
-    return gk, w, u, qg, kg
+        _call_aclnn("aclnnChunkKdaBwdRecompute", build_args, (w, u, qg, kg, gk))
+        return gk, w, u, qg, kg
+
+    return run_kda_recompute_with_tail_guard(
+        q, k, v, g, beta, a, launch,
+        cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+        chunk_size=int(chunk_size),
+    )
 
 
 def npu_solve_tri(x, *, cu_seqlens=None, chunk_indices=None, layout="bsnd"):
