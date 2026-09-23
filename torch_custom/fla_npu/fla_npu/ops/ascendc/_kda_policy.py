@@ -181,6 +181,16 @@ def _kda_host_cu(cu):
     return tuple(int(x) for x in cu)
 
 
+def _kda_chunk_pairs(cu, chunk_size):
+    """Canonical sequence-major chunk_indices for a host cu_seqlens."""
+    pairs = []
+    for seq, (begin, end) in enumerate(zip(cu, cu[1:])):
+        n_chunks = (end - begin + chunk_size - 1) // chunk_size
+        for chunk in range(n_chunks):
+            pairs.extend((seq, chunk))
+    return tuple(pairs)
+
+
 def _kda_pad_token_tensor(tensor, token_dim, seqlen, pad_rows, repeat_last=False):
     import torch
 
@@ -301,9 +311,15 @@ def run_kda_recompute_with_tail_guard(
             )
             for name, tensor in tensors.items()
         }
+        # Padding stays inside the existing last chunk, so the chunk count
+        # does not grow. Varlen tiling rejects cu_seqlens without
+        # chunk_indices (ACLNN_ERR_INNER_NULLPTR / 561103).
         padded_cu = None if cu is None else (0, seqlen + pad_rows)
+        padded_indices = (
+            None if padded_cu is None else _kda_chunk_pairs(padded_cu, chunk_size)
+        )
         return _slice_outputs(
-            _launch(padded, padded_cu, None), seqlen)
+            _launch(padded, padded_cu, padded_indices), seqlen)
 
     return _launch(tensors, cu, chunk_indices)
 
@@ -366,7 +382,7 @@ def run_kda_bwd_optimized_with_tail_guard(args, launch):
                 repeat_last=(name == "gk"))
         if cu is not None:
             args["cu_seqlens"] = (0, seqlen + pad_rows)
-            args["chunk_indices"] = None
+            args["chunk_indices"] = _kda_chunk_pairs(args["cu_seqlens"], chunk_size)
         return _kda_slice_padded_bwd(launch(args), seqlen, token_dim)
 
     return launch(args)
