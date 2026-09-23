@@ -1258,6 +1258,7 @@ def npu_chunk_kda_bwd_recompute(q, k, v, g, beta, a, chunk_size, *,
         q, k, v, g, beta, a, launch,
         cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
         chunk_size=int(chunk_size),
+        repair_kg=bool(use_gate_in_kernel),
     )
 
 

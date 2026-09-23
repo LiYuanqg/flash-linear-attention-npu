@@ -191,6 +191,60 @@ def _kda_chunk_pairs(cu, chunk_size):
     return tuple(pairs)
 
 
+def _sync_npu(tensor):
+    """Wait until queued NPU work that produced ``tensor`` has stored it.
+
+    Stable launches go through the torch_npu task queue and return before the
+    kernel store runs. A later in-place write on that same storage is then
+    overwritten when the kernel is submitted, so the caller still sees the
+    unrepaired values.
+    """
+    device = getattr(tensor, "device", None)
+    if device is None or getattr(device, "type", None) != "npu":
+        return
+    import torch
+    torch.npu.synchronize(device)
+
+
+def _repair_padded_chunk_kg(k, gk, kg, valid_tokens, chunk_size):
+    """Rebuild ``kg`` on the last partial chunk after a zero-padded relaunch.
+
+    Padding makes that chunk 64 rows so the fused VF does not spill into
+    rows 0..16. The extra ``g`` rows are zeros, but safe-gate maps
+    ``g=0`` to ``lower_bound * sigmoid(exp(A_log) * dt_bias)``, which is
+    not a zero cumsum step. The kernel then takes ``gk_last`` from the
+    padded row and writes ``kg = k * exp2(gk_last - gk)`` for every valid
+    token in the chunk. ``gk`` itself is causal, so the last real token is
+    the ``gk_last`` those rows should have used.
+    """
+    import torch
+
+    if gk is None or kg is None or valid_tokens <= 0:
+        return kg
+    start = (int(valid_tokens) // int(chunk_size)) * int(chunk_size)
+    if start >= int(valid_tokens):
+        return kg
+    hk = int(k.shape[1])
+    hv = int(gk.shape[1])
+    if hk <= 0 or hv % hk != 0:
+        return kg
+    k_hv = k if hv == hk else k.repeat_interleave(hv // hk, dim=1)
+    gk_tail = gk.narrow(2, start, int(valid_tokens) - start)
+    gk_last = gk.narrow(2, int(valid_tokens) - 1, 1)
+    n_tail = int(valid_tokens) - start
+    delta = (gk_last - gk_tail).clamp(-80.0, 80.0)
+    fixed = (k_hv.narrow(2, start, n_tail).float() * torch.exp2(delta)).to(dtype=kg.dtype)
+    # New storage: the queued kernel still owns the buffer it was given.
+    out = kg.clone()
+    out.narrow(2, start, n_tail).copy_(fixed)
+    if _KDA_TAIL_GUARD_LOGS < 8:
+        max_abs = float((fixed.float() - kg.narrow(2, start, n_tail).float()).abs().max())
+        _log_kda_tail_guard(
+            "KDA recompute kg repair seqlen=%d max_abs=%s" % (int(valid_tokens), max_abs)
+        )
+    return out
+
+
 def _kda_pad_token_tensor(tensor, token_dim, seqlen, pad_rows, repeat_last=False):
     import torch
 
@@ -238,14 +292,15 @@ def _kda_combine_split_bwd(results):
 
 def run_kda_recompute_with_tail_guard(
     q, k, v, g, beta, a, launch, *, cu_seqlens=None, chunk_indices=None,
-    chunk_size=64,
+    chunk_size=64, repair_kg=False,
 ):
     """Zero-pad leftover T%64 before ChunkKdaBwdRecompute.
 
     Fused VF extra stores can overwrite leftover rows 0..16. Kernel repair
     only covers leftover < 16, so training tails of 16-63 stay wrong unless
-    the last chunk is a full 64. Extra gate rows are zeros so leftover
-    gk_last is unchanged. ``launch`` returns ``(gk, w, u, qg, kg)``.
+    the last chunk is a full 64. When the kernel applies safe-gate itself,
+    ``repair_kg`` rebuilds the last chunk's ``kg`` from the real last token.
+    ``launch`` returns ``(gk, w, u, qg, kg)``.
     """
     import torch
 
@@ -287,7 +342,7 @@ def run_kda_recompute_with_tail_guard(
             parts.append(run_kda_recompute_with_tail_guard(
                 sub["q"], sub["k"], sub["v"], sub["g"], sub["beta"], sub["a"],
                 launch, cu_seqlens=None, chunk_indices=None,
-                chunk_size=chunk_size,
+                chunk_size=chunk_size, repair_kg=repair_kg,
             ))
         combined = []
         for output_index in range(5):
@@ -318,8 +373,13 @@ def run_kda_recompute_with_tail_guard(
         padded_indices = (
             None if padded_cu is None else _kda_chunk_pairs(padded_cu, chunk_size)
         )
-        return _slice_outputs(
-            _launch(padded, padded_cu, padded_indices), seqlen)
+        outputs = _launch(padded, padded_cu, padded_indices)
+        if repair_kg and outputs[0] is not None and outputs[4] is not None:
+            _sync_npu(outputs[0])
+            gk, w, u, qg, kg = outputs
+            kg = _repair_padded_chunk_kg(k, gk, kg, seqlen, chunk_size)
+            outputs = (gk, w, u, qg, kg)
+        return _slice_outputs(outputs, seqlen)
 
     return _launch(tensors, cu, chunk_indices)
 
