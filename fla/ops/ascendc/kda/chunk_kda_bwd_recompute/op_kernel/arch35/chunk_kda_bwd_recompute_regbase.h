@@ -19,6 +19,9 @@ namespace KdaBwdRecomputeArch35 {
 constexpr float kLn2 = 0.69314718055994530942f;
 constexpr float kExpInputMax = 80.0f * kLn2;
 constexpr float kExpInputMin = -80.0f * kLn2;
+// FwdPrepare V6 stores gk in log2 and clamps ±80 before *ln2 + fp32 Exp.
+constexpr float kStoredExpMax = 80.0f;
+constexpr float kStoredExpMin = -80.0f;
 // fp16 Exp saturates beyond ~exp(±11). Pass-2 qg/kg write bf16 so this matches
 // the output dtype; gk cumsum stays fp32 Exp.
 constexpr float kHalfExpInputMax = 11.0f;
