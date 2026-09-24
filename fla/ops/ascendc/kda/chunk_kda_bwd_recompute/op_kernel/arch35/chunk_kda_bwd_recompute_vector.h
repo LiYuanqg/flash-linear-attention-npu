@@ -127,6 +127,8 @@ private:
         auto expFp = valFp[kk];
         auto prodFp = valFp[2 * kk];
         const uint32_t n = curChunkSize * kk;
+        SetFlag<HardEvent::V_MTE2>(vToMte2Event_);
+        WaitFlag<HardEvent::V_MTE2>(vToMte2Event_);
         DataCopy(qLocal, qTensor_[qkBase], n);
         DataCopy(kLocal, kTensor_[qkBase], n);
         SetFlag<HardEvent::MTE2_V>(mte2ToVEvent_[buf]);
@@ -147,9 +149,9 @@ private:
             PipeBarrier<PIPE_V>();
             Muls(expFp, expFp, KDA_BWD_RECOMPUTE_LN2, kk);
             PipeBarrier<PIPE_V>();
-            Mins(expFp, expFp, KdaBwdRecomputeArch35::kExpInputMax, kk);
+            Mins(expFp, expFp, KdaBwdRecomputeArch35::kHalfExpInputMax, kk);
             PipeBarrier<PIPE_V>();
-            Maxs(expFp, expFp, KdaBwdRecomputeArch35::kExpInputMin, kk);
+            Maxs(expFp, expFp, KdaBwdRecomputeArch35::kHalfExpInputMin, kk);
             PipeBarrier<PIPE_V>();
             Exp(expFp, expFp, kk);
             PipeBarrier<PIPE_V>();
@@ -174,9 +176,9 @@ private:
             PipeBarrier<PIPE_V>();
             Muls(expFp, expFp, KDA_BWD_RECOMPUTE_LN2, kk);
             PipeBarrier<PIPE_V>();
-            Mins(expFp, expFp, KdaBwdRecomputeArch35::kExpInputMax, kk);
+            Mins(expFp, expFp, KdaBwdRecomputeArch35::kHalfExpInputMax, kk);
             PipeBarrier<PIPE_V>();
-            Maxs(expFp, expFp, KdaBwdRecomputeArch35::kExpInputMin, kk);
+            Maxs(expFp, expFp, KdaBwdRecomputeArch35::kHalfExpInputMin, kk);
             PipeBarrier<PIPE_V>();
             Exp(expFp, expFp, kk);
             PipeBarrier<PIPE_V>();
@@ -383,10 +385,13 @@ private:
         pipe_->InitBuffer(aLogAllBuf_, 256 * sizeof(float));
         pipe_->InitBuffer(repairRowBuf_, 3 * kk * sizeof(float));
         vToMte3Event_ = pipe_->AllocEventID<HardEvent::V_MTE3>();
+        vToMte2Event_ = pipe_->AllocEventID<HardEvent::V_MTE2>();
         vToSEvent_ = pipe_->AllocEventID<HardEvent::V_S>();
         sToVEvent_ = pipe_->AllocEventID<HardEvent::S_V>();
         SetFlag<HardEvent::V_MTE3>(vToMte3Event_);
         WaitFlag<HardEvent::V_MTE3>(vToMte3Event_);
+        SetFlag<HardEvent::V_MTE2>(vToMte2Event_);
+        WaitFlag<HardEvent::V_MTE2>(vToMte2Event_);
         SetFlag<HardEvent::V_S>(vToSEvent_);
         WaitFlag<HardEvent::V_S>(vToSEvent_);
         SetFlag<HardEvent::S_V>(sToVEvent_);
@@ -474,6 +479,7 @@ private:
         pipe_->ReleaseEventID<HardEvent::MTE2_V>(mte2ToVEvent_[0]);
         pipe_->ReleaseEventID<HardEvent::MTE2_V>(mte2ToVEvent_[1]);
         pipe_->ReleaseEventID<HardEvent::V_MTE3>(vToMte3Event_);
+        pipe_->ReleaseEventID<HardEvent::V_MTE2>(vToMte2Event_);
         pipe_->ReleaseEventID<HardEvent::MTE3_MTE2>(mte3ToMte2Event_[0]);
         pipe_->ReleaseEventID<HardEvent::MTE3_MTE2>(mte3ToMte2Event_[1]);
         pipe_->ReleaseEventID<HardEvent::V_S>(vToSEvent_);
@@ -504,6 +510,7 @@ private:
 
         mte2ToVEvent_[0] = pipe_->AllocEventID<HardEvent::MTE2_V>();
         vToMte3Event_ = pipe_->AllocEventID<HardEvent::V_MTE3>();
+        vToMte2Event_ = pipe_->AllocEventID<HardEvent::V_MTE2>();
         mte3ToVEvent_ = pipe_->AllocEventID<HardEvent::MTE3_V>();
         mte3ToMte2Event_[0] = pipe_->AllocEventID<HardEvent::MTE3_MTE2>();
         vToSEvent_ = pipe_->AllocEventID<HardEvent::V_S>();
@@ -512,6 +519,8 @@ private:
         WaitFlag<HardEvent::MTE2_V>(mte2ToVEvent_[0]);
         SetFlag<HardEvent::V_MTE3>(vToMte3Event_);
         WaitFlag<HardEvent::V_MTE3>(vToMte3Event_);
+        SetFlag<HardEvent::V_MTE2>(vToMte2Event_);
+        WaitFlag<HardEvent::V_MTE2>(vToMte2Event_);
         SetFlag<HardEvent::MTE3_V>(mte3ToVEvent_);
         SetFlag<HardEvent::MTE3_MTE2>(mte3ToMte2Event_[0]);
         WaitFlag<HardEvent::MTE3_MTE2>(mte3ToMte2Event_[0]);
@@ -571,6 +580,7 @@ private:
         WaitFlag<HardEvent::MTE3_V>(mte3ToVEvent_);
         pipe_->ReleaseEventID<HardEvent::MTE2_V>(mte2ToVEvent_[0]);
         pipe_->ReleaseEventID<HardEvent::V_MTE3>(vToMte3Event_);
+        pipe_->ReleaseEventID<HardEvent::V_MTE2>(vToMte2Event_);
         pipe_->ReleaseEventID<HardEvent::MTE3_V>(mte3ToVEvent_);
         pipe_->ReleaseEventID<HardEvent::MTE3_MTE2>(mte3ToMte2Event_[0]);
         pipe_->ReleaseEventID<HardEvent::V_S>(vToSEvent_);
@@ -959,6 +969,7 @@ private:
 
     TEventID mte2ToVEvent_[2];
     TEventID vToMte3Event_;
+    TEventID vToMte2Event_;
     TEventID mte3ToVEvent_;
     TEventID mte3ToMte2Event_[2];
     TEventID vToSEvent_;
