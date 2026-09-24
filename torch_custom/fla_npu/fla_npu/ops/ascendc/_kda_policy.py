@@ -259,18 +259,6 @@ def _kda_pad_token_tensor(tensor, token_dim, seqlen, pad_rows, repeat_last=False
     return torch.cat((tensor, tail), dim=token_dim).contiguous()
 
 
-def _kda_slice_padded_bwd(outputs, original_seqlen, token_dim):
-    restored = []
-    for index, value in enumerate(outputs):
-        if value is None:
-            restored.append(None)
-            continue
-        if index < 5:
-            value = value.narrow(token_dim, 0, original_seqlen)
-        restored.append(value.contiguous())
-    return tuple(restored)
-
-
 def _kda_combine_split_bwd(results):
     import torch
 
@@ -385,14 +373,13 @@ def run_kda_recompute_with_tail_guard(
 
 
 def run_kda_bwd_optimized_with_tail_guard(args, launch):
-    """Keep V2 C-Intra off leftover rows.
+    """Launch V2 backward on the real token length.
 
-    Packed leftover sequences are split into dense calls; a single leftover
-    chunk is padded to 64 inside the existing last state, then token grads
-    are sliced back.  Full 64-token chunks stay on one launch.
+    The kernel already shortens the last chunk to chunkLen and keeps C-Intra
+    on the tail-safe path when that length is not 64.  Padding the tail to 64
+    makes the last chunk look full, so those padded rows enter the shared-B
+    path.  Multi-sequence packed leftovers are still split into dense calls.
     """
-    import torch
-
     args = dict(args)
     q = args["q"]
     if q is None:
@@ -400,8 +387,6 @@ def run_kda_bwd_optimized_with_tail_guard(args, launch):
     chunk_size = int(args.get("chunk_size") or 64)
     cu = _kda_host_cu(args.get("cu_seqlens"))
     packed = cu is not None
-    seqlen = int(q.shape[1] if packed else q.shape[2])
-    token_dim = 1 if packed else 2
     has_varlen_tail = packed and any(
         (end - begin) % chunk_size != 0 for begin, end in zip(cu, cu[1:]))
 
@@ -430,19 +415,5 @@ def run_kda_bwd_optimized_with_tail_guard(args, launch):
             results.append(run_kda_bwd_optimized_with_tail_guard(sub, launch))
             chunk_begin += n_chunks
         return _kda_combine_split_bwd(results)
-
-    if seqlen % chunk_size != 0 and (cu is None or len(cu) == 2):
-        _log_kda_tail_guard(
-            f"KDA V2 tail-guard pad seqlen={seqlen} packed={packed}"
-        )
-        pad_rows = ((seqlen + chunk_size - 1) // chunk_size) * chunk_size - seqlen
-        for name in _KDA_BWD_TOKEN_TENSORS:
-            args[name] = _kda_pad_token_tensor(
-                args.get(name), token_dim, seqlen, pad_rows,
-                repeat_last=(name == "gk"))
-        if cu is not None:
-            args["cu_seqlens"] = (0, seqlen + pad_rows)
-            args["chunk_indices"] = _kda_chunk_pairs(args["cu_seqlens"], chunk_size)
-        return _kda_slice_padded_bwd(launch(args), seqlen, token_dim)
 
     return launch(args)
