@@ -106,72 +106,84 @@ private:
         WaitFlag<HardEvent::MTE2_V>(mte2Event);
     }
 
-    __aicore__ inline void RepairLeftoverRow0(uint32_t buf, uint32_t curChunkSize)
+    __aicore__ inline void RepairLeftoverChunk(
+        uint32_t buf, uint32_t loopIdx, uint64_t h, uint32_t bos, uint32_t curChunkSize)
     {
         constexpr uint32_t kk = KdaBwdRecomputeArch35::kK;
-        constexpr uint32_t saveRow = KdaBwdRecomputeArch35::kLeftoverSaveRow;
-        const uint32_t n = curChunkSize * kk;
+        if (curChunkSize == 0U || curChunkSize >= KdaBwdRecomputeArch35::kBt) {
+            return;
+        }
+        const uint64_t hk = h / hvPerHk_;
+        const uint64_t coreLoopsInB = (T_ + chunkSize_ - 1) / chunkSize_;
+        const uint64_t bIdx = isVariable_ ? 0 : (loopIdx / coreLoopsInB);
+        const uint64_t bosK = isVariable_ ? bos : (bos - bIdx * (Hv_ - Hk_) * T_);
+        const uint64_t qkBase = (hk * T_ + bosK) * K_;
         auto gFp32 = gFp32Buf_[buf].Get<float>();
         auto qLocal = qBuf_[buf].Get<QkType>();
         auto kLocal = kBuf_[buf].Get<QkType>();
         auto outLocal = outBuf_[buf].Get<QkType>();
         auto betaFp32 = betaFp32Buf_[buf].Get<float>();
-        auto qFp = gFp32[16 * kk];
-        auto expFp = gFp32[32 * kk];
-        auto kFp = gFp32[48 * kk];
-        Cast(qFp, qLocal[saveRow * kk], RoundMode::CAST_NONE, n);
-        Cast(kFp, kLocal[saveRow * kk], RoundMode::CAST_NONE, n);
-        DataCopy(expFp, gFp32[0], n);
-        PipeBarrier<PIPE_V>();
-        Muls(expFp, expFp, KDA_BWD_RECOMPUTE_LN2, n);
-        PipeBarrier<PIPE_V>();
-        Mins(expFp, expFp, KdaBwdRecomputeArch35::kExpInputMax, n);
-        PipeBarrier<PIPE_V>();
-        Maxs(expFp, expFp, KdaBwdRecomputeArch35::kExpInputMin, n);
-        PipeBarrier<PIPE_V>();
-        Exp(expFp, expFp, n);
-        PipeBarrier<PIPE_V>();
-        Mul(qFp, qFp, expFp, n);
-        PipeBarrier<PIPE_V>();
-        Cast(qLocal[0], qFp, RoundMode::CAST_RINT, n);
-        Mul(kFp, kFp, expFp, n);
-        PipeBarrier<PIPE_V>();
-        uint32_t betaN = (curChunkSize + 7U) & ~7U;
-        if (betaN == 0U) {
-            betaN = 8U;
-        }
+        auto valFp = repairRowBuf_.Get<float>();
+        auto expFp = valFp[kk];
+        auto prodFp = valFp[2 * kk];
+        const uint32_t n = curChunkSize * kk;
+        DataCopy(qLocal, qTensor_[qkBase], n);
+        DataCopy(kLocal, kTensor_[qkBase], n);
+        SetFlag<HardEvent::MTE2_V>(mte2ToVEvent_[buf]);
+        WaitFlag<HardEvent::MTE2_V>(mte2ToVEvent_[buf]);
         if constexpr (!std::is_same<BetaType, float>::value) {
+            uint32_t betaN = (curChunkSize + 7U) & ~7U;
+            if (betaN == 0U) {
+                betaN = 8U;
+            }
             Cast(betaFp32, betaRawBuf_[buf].Get<BetaType>(), RoundMode::CAST_NONE, betaN);
             PipeBarrier<PIPE_V>();
         }
+        const uint32_t last = (curChunkSize - 1U) * kk;
         for (uint32_t row = 0; row < curChunkSize; ++row) {
+            const uint32_t off = row * kk;
+            Cast(valFp, qLocal[off], RoundMode::CAST_NONE, kk);
+            DataCopy(expFp, gFp32[off], kk);
+            PipeBarrier<PIPE_V>();
+            Muls(expFp, expFp, KDA_BWD_RECOMPUTE_LN2, kk);
+            PipeBarrier<PIPE_V>();
+            Mins(expFp, expFp, KdaBwdRecomputeArch35::kExpInputMax, kk);
+            PipeBarrier<PIPE_V>();
+            Maxs(expFp, expFp, KdaBwdRecomputeArch35::kExpInputMin, kk);
+            PipeBarrier<PIPE_V>();
+            Exp(expFp, expFp, kk);
+            PipeBarrier<PIPE_V>();
+            Mul(prodFp, valFp, expFp, kk);
+            PipeBarrier<PIPE_V>();
+            Cast(qLocal[off], prodFp, RoundMode::CAST_RINT, kk);
+            Cast(valFp, kLocal[off], RoundMode::CAST_NONE, kk);
+            PipeBarrier<PIPE_V>();
+            Mul(prodFp, valFp, expFp, kk);
+            PipeBarrier<PIPE_V>();
             SetFlag<HardEvent::V_S>(vToSEvent_);
             WaitFlag<HardEvent::V_S>(vToSEvent_);
             const float beta = betaFp32.GetValue(row);
             SetFlag<HardEvent::S_V>(sToVEvent_);
             WaitFlag<HardEvent::S_V>(sToVEvent_);
-            Muls(kFp[row * kk], kFp[row * kk], beta, kk);
+            Muls(prodFp, prodFp, beta, kk);
             PipeBarrier<PIPE_V>();
+            Cast(kLocal[off], prodFp, RoundMode::CAST_RINT, kk);
+            DataCopy(expFp, gFp32[last], kk);
+            PipeBarrier<PIPE_V>();
+            Sub(expFp, expFp, gFp32[off], kk);
+            PipeBarrier<PIPE_V>();
+            Muls(expFp, expFp, KDA_BWD_RECOMPUTE_LN2, kk);
+            PipeBarrier<PIPE_V>();
+            Mins(expFp, expFp, KdaBwdRecomputeArch35::kExpInputMax, kk);
+            PipeBarrier<PIPE_V>();
+            Maxs(expFp, expFp, KdaBwdRecomputeArch35::kExpInputMin, kk);
+            PipeBarrier<PIPE_V>();
+            Exp(expFp, expFp, kk);
+            PipeBarrier<PIPE_V>();
+            Mul(prodFp, valFp, expFp, kk);
+            PipeBarrier<PIPE_V>();
+            Cast(outLocal[off], prodFp, RoundMode::CAST_RINT, kk);
         }
-        Cast(kLocal[0], kFp, RoundMode::CAST_RINT, n);
-        Cast(kFp, kLocal[saveRow * kk], RoundMode::CAST_NONE, n);
-        for (uint32_t row = 0; row < curChunkSize; ++row) {
-            DataCopy(expFp[row * kk], gFp32[(curChunkSize - 1) * kk], kk);
-        }
-        PipeBarrier<PIPE_V>();
-        Sub(expFp, expFp, gFp32[0], n);
-        PipeBarrier<PIPE_V>();
-        Muls(expFp, expFp, KDA_BWD_RECOMPUTE_LN2, n);
-        PipeBarrier<PIPE_V>();
-        Mins(expFp, expFp, KdaBwdRecomputeArch35::kExpInputMax, n);
-        PipeBarrier<PIPE_V>();
-        Maxs(expFp, expFp, KdaBwdRecomputeArch35::kExpInputMin, n);
-        PipeBarrier<PIPE_V>();
-        Exp(expFp, expFp, n);
-        PipeBarrier<PIPE_V>();
-        Mul(kFp, kFp, expFp, n);
-        PipeBarrier<PIPE_V>();
-        Cast(outLocal[0], kFp, RoundMode::CAST_RINT, n);
     }
 
     __aicore__ inline void FastCopyHeadIn(
@@ -220,7 +232,8 @@ private:
         SetFlag<HardEvent::MTE2_V>(mte2ToVEvent_[buf]);
     }
 
-    __aicore__ inline void FastRunVf(uint32_t buf, uint64_t h, uint32_t curChunkSize)
+    __aicore__ inline void FastRunVf(
+        uint32_t buf, uint32_t loopIdx, uint64_t h, uint32_t bos, uint32_t curChunkSize)
     {
         auto gFp32 = gFp32Buf_[buf].Get<float>();
         auto qLocal = qBuf_[buf].Get<QkType>();
@@ -253,14 +266,6 @@ private:
         auto kPtr = (__ubuf__ QkType *)kLocal.GetPhyAddr();
         auto vPtr = (__ubuf__ QkType *)vLocal.GetPhyAddr();
         auto kgPtr = (__ubuf__ QkType *)outLocal.GetPhyAddr();
-        constexpr uint32_t kk = KdaBwdRecomputeArch35::kK;
-        constexpr uint32_t saveRow = KdaBwdRecomputeArch35::kLeftoverSaveRow;
-        if (curChunkSize > 0 && curChunkSize < 16) {
-            const uint32_t saveElems = curChunkSize * kk;
-            DataCopy(qLocal[saveRow * kk], qLocal[0], saveElems);
-            DataCopy(kLocal[saveRow * kk], kLocal[0], saveElems);
-            PipeBarrier<PIPE_V>();
-        }
         if (curChunkSize == KdaBwdRecomputeArch35::kBt) {
             if (hasDtBias_ && hasALog_) {
                 KdaBwdRecomputeArch35::FusedRecomputeChunk128Regbase<
@@ -305,9 +310,7 @@ private:
                 vfRows, lowerBound_);
         }
         PipeBarrier<PIPE_V>();
-        if (curChunkSize > 0 && curChunkSize < 16) {
-            RepairLeftoverRow0(buf, curChunkSize);
-        }
+        RepairLeftoverChunk(buf, loopIdx, h, bos, curChunkSize);
         const uint32_t padRows = KdaBwdRecomputeArch35::PadMmadRows(curChunkSize);
         KdaBwdRecomputeArch35::ZeroPadUbTail(
             kLocal, curChunkSize, padRows, KdaBwdRecomputeArch35::kK);
@@ -378,6 +381,7 @@ private:
             SetFlag<HardEvent::MTE3_MTE2>(mte3ToMte2Event_[i]);
         }
         pipe_->InitBuffer(aLogAllBuf_, 256 * sizeof(float));
+        pipe_->InitBuffer(repairRowBuf_, 3 * kk * sizeof(float));
         vToMte3Event_ = pipe_->AllocEventID<HardEvent::V_MTE3>();
         vToSEvent_ = pipe_->AllocEventID<HardEvent::V_S>();
         sToVEvent_ = pipe_->AllocEventID<HardEvent::S_V>();
@@ -404,6 +408,7 @@ private:
         bool hasLoaded = false;
         bool hasPublished = false;
         uint32_t loadBuf = 0;
+        uint32_t loadLoop = 0;
         uint32_t loadBos = 0;
         uint32_t loadRows = 0;
         uint32_t loadSlot = 0;
@@ -437,13 +442,14 @@ private:
 
                         FastCopyHeadIn(pp, static_cast<uint32_t>(loopIdx), h, bos, rows);
                         if (hasLoaded) {
-                            FastRunVf(loadBuf, loadH, loadRows);
+                            FastRunVf(loadBuf, loadLoop, loadH, loadBos, loadRows);
                             FastPublishL1(loadBuf, loadSlot, loadRows, hasPublished);
                             FastStoreGm(loadBuf, loadH, loadBos, loadRows);
                             hasPublished = true;
                         }
                         hasLoaded = true;
                         loadBuf = pp;
+                        loadLoop = static_cast<uint32_t>(loopIdx);
                         loadBos = bos;
                         loadRows = rows;
                         loadSlot = slot;
@@ -455,7 +461,7 @@ private:
         }
 
         if (hasLoaded) {
-            FastRunVf(loadBuf, loadH, loadRows);
+            FastRunVf(loadBuf, loadLoop, loadH, loadBos, loadRows);
             FastPublishL1(loadBuf, loadSlot, loadRows, hasPublished);
             FastStoreGm(loadBuf, loadH, loadBos, loadRows);
         }
@@ -494,6 +500,7 @@ private:
         pipe_->InitBuffer(expABuf_, kk * sizeof(float));
         pipe_->InitBuffer(oneFp32Buf_, kk * sizeof(float));
         pipe_->InitBuffer(aLogAllBuf_, 256 * sizeof(float));
+        pipe_->InitBuffer(repairRowBuf_, 3 * kk * sizeof(float));
 
         mte2ToVEvent_[0] = pipe_->AllocEventID<HardEvent::MTE2_V>();
         vToMte3Event_ = pipe_->AllocEventID<HardEvent::V_MTE3>();
@@ -657,13 +664,6 @@ private:
             auto kPtr = (__ubuf__ QkType *)kLocal.GetPhyAddr();
             auto vPtr = (__ubuf__ QkType *)vLocal.GetPhyAddr();
             auto kgPtr = (__ubuf__ QkType *)outLocal.GetPhyAddr();
-            if (curChunkSize > 0 && curChunkSize < 16) {
-                constexpr uint32_t saveRow = KdaBwdRecomputeArch35::kLeftoverSaveRow;
-                const uint32_t saveElems = curChunkSize * kk;
-                DataCopy(qLocal[saveRow * kk], qLocal[0], saveElems);
-                DataCopy(kLocal[saveRow * kk], kLocal[0], saveElems);
-                PipeBarrier<PIPE_V>();
-            }
             if (hasDtBias_ && hasALog_) {
                 KdaBwdRecomputeArch35::FusedRecomputeChunk128Regbase<
                     QkType, QkType, GateType, BetaType, true, true>(
@@ -686,9 +686,7 @@ private:
                     vfRows, lowerBound_);
             }
             PipeBarrier<PIPE_V>();
-            if (curChunkSize > 0 && curChunkSize < 16) {
-                RepairLeftoverRow0(0, curChunkSize);
-            }
+            RepairLeftoverChunk(0, loopIdx, h, bos, curChunkSize);
             const uint32_t padRows = KdaBwdRecomputeArch35::PadMmadRows(curChunkSize);
             KdaBwdRecomputeArch35::ZeroPadUbTail(kLocal, curChunkSize, padRows, kk);
             KdaBwdRecomputeArch35::ZeroPadUbTail(vLocal, curChunkSize, padRows, vv);
@@ -957,6 +955,7 @@ private:
     TBuf<TPosition::VECCALC> expABuf_;
     TBuf<TPosition::VECCALC> oneFp32Buf_;
     TBuf<TPosition::VECCALC> aLogAllBuf_;
+    TBuf<TPosition::VECCALC> repairRowBuf_;
 
     TEventID mte2ToVEvent_[2];
     TEventID vToMte3Event_;
