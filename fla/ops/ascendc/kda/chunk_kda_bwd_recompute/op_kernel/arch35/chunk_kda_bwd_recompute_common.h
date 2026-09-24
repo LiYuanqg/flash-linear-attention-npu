@@ -12,9 +12,6 @@ namespace KdaBwdRecomputeArch35 {
 constexpr uint32_t kBt = 64;
 constexpr uint32_t kK = 128;
 constexpr uint32_t kV = 128;
-// Leftover VF software-pipeline extra stores can reach ~row 16. Keep the
-// pre-VF q/k copy past that range (buffer is 64 rows).
-constexpr uint32_t kLeftoverSaveRow = 48;
 // Mix-core software pipeline: 2 AIV × 2-deep UB = 4 heads in flight.
 constexpr uint32_t kHeadRotate = 4;
 
