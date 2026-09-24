@@ -22,10 +22,6 @@ constexpr float kExpInputMin = -80.0f * kLn2;
 // FwdPrepare V6 stores gk in log2 and clamps ±80 before *ln2 + fp32 Exp.
 constexpr float kStoredExpMax = 80.0f;
 constexpr float kStoredExpMin = -80.0f;
-// fp16 Exp saturates beyond ~exp(±11). Pass-2 qg/kg write bf16 so this matches
-// the output dtype; gk cumsum stays fp32 Exp.
-constexpr float kHalfExpInputMax = 11.0f;
-constexpr float kHalfExpInputMin = -11.0f;
 
 template <bool HAS_BIAS, bool HAS_ALOG>
 static __simd_vf__ inline void AccumulateSafeGateChunk128Regbase(
@@ -64,7 +60,6 @@ static __simd_vf__ inline void AccumulateSafeGateChunk128Regbase(
     RegTensor<float> gateOneReg;
     RegTensor<float> sigmoidZeroReg;
     RegTensor<float> sigmoidOneReg;
-    const float gateScale = lowerBound * KDA_BWD_RECOMPUTE_RCP_LN2;
     for (uint16_t row = 0; row < rows; ++row) {
         const uint32_t rowOffset = static_cast<uint32_t>(row) * ROW_ELEMENTS;
         LoadAlign<float, LoadDist::DIST_NORM>(gateZeroReg, input + rowOffset);
@@ -81,8 +76,10 @@ static __simd_vf__ inline void AccumulateSafeGateChunk128Regbase(
         Adds(gateOneReg, gateOneReg, 1.0f, floatMask);
         Div(sigmoidZeroReg, oneZeroReg, gateZeroReg, floatMask);
         Div(sigmoidOneReg, oneOneReg, gateOneReg, floatMask);
-        Muls(sigmoidZeroReg, sigmoidZeroReg, gateScale, floatMask);
-        Muls(sigmoidOneReg, sigmoidOneReg, gateScale, floatMask);
+        Muls(sigmoidZeroReg, sigmoidZeroReg, lowerBound, floatMask);
+        Muls(sigmoidOneReg, sigmoidOneReg, lowerBound, floatMask);
+        Muls(sigmoidZeroReg, sigmoidZeroReg, KDA_BWD_RECOMPUTE_RCP_LN2, floatMask);
+        Muls(sigmoidOneReg, sigmoidOneReg, KDA_BWD_RECOMPUTE_RCP_LN2, floatMask);
         Add(accZeroReg, accZeroReg, sigmoidZeroReg, floatMask);
         Add(accOneReg, accOneReg, sigmoidOneReg, floatMask);
         StoreAlign(input + rowOffset, accZeroReg, floatMask);
@@ -145,19 +142,26 @@ __simd_callee__ inline void StoreGateRegbasePair(
     }
 }
 
-__simd_callee__ inline void ExpPairViaHalf(
+// FwdPrepare V6 / leftover Repair: clamp stored log2 ±80, *ln2, fp32 Exp.
+// Half Exp saturates at ~±11 (natural), which clips kg when |Glast-g| > 16.
+__simd_callee__ inline void ExpPairStoredLog2(
     AscendC::MicroAPI::RegTensor<float> &zeroReg,
     AscendC::MicroAPI::RegTensor<float> &oneReg,
-    AscendC::MicroAPI::RegTensor<half> &halfReg,
-    AscendC::MicroAPI::MaskReg &floatMask,
-    AscendC::MicroAPI::MaskReg &halfMask)
+    AscendC::MicroAPI::MaskReg &floatMask)
 {
     using namespace AscendC::MicroAPI;
-    CastFloat2Half<half>(halfReg, zeroReg, oneReg, floatMask);
-    Exp(halfReg, halfReg, halfMask);
-    CastHalf2Float<half>(zeroReg, oneReg, halfReg, halfMask);
+    Maxs(zeroReg, zeroReg, kStoredExpMin, floatMask);
+    Maxs(oneReg, oneReg, kStoredExpMin, floatMask);
+    Mins(zeroReg, zeroReg, kStoredExpMax, floatMask);
+    Mins(oneReg, oneReg, kStoredExpMax, floatMask);
+    Muls(zeroReg, zeroReg, kLn2, floatMask);
+    Muls(oneReg, oneReg, kLn2, floatMask);
+    Exp(zeroReg, zeroReg, floatMask);
+    Exp(oneReg, oneReg, floatMask);
 }
 
+// Full-chunk VF: pass-1 matches FwdPrepare V0 two-step log2 scale; pass-2
+// matches V6 stored-log2 clamp ±80 then *ln2 + fp32 Exp (not half Exp ±11).
 template <typename InputT, typename OutputT, typename GateT, typename BetaT, bool HAS_BIAS, bool HAS_ALOG,
           bool kFixed64 = false>
 static __simd_vf__ inline void FusedRecomputeChunk128Regbase(
@@ -189,11 +193,10 @@ static __simd_vf__ inline void FusedRecomputeChunk128Regbase(
         RegTensor<float> sigmoidZeroReg;
         RegTensor<float> sigmoidOneReg;
         RegTensor<GateT> gateRawReg;
-        const float gateScale = lowerBound * KDA_BWD_RECOMPUTE_RCP_LN2;
         Duplicate(accZeroReg, 0.0f, floatMask);
         Duplicate(accOneReg, 0.0f, floatMask);
-        Duplicate(oneZeroReg, gateScale, floatMask);
-        Duplicate(oneOneReg, gateScale, floatMask);
+        Duplicate(oneZeroReg, 1.0f, floatMask);
+        Duplicate(oneOneReg, 1.0f, floatMask);
         if constexpr (HAS_BIAS) {
             LoadAlign<float, LoadDist::DIST_NORM>(biasZeroReg, bias);
             LoadAlign<float, LoadDist::DIST_NORM>(biasOneReg, bias + FLOAT_ELEMENTS_PER_REG);
@@ -232,6 +235,10 @@ static __simd_vf__ inline void FusedRecomputeChunk128Regbase(
             Adds(gateOneReg, gateOneReg, 1.0f, floatMask);
             Div(sigmoidZeroReg, oneZeroReg, gateZeroReg, floatMask);
             Div(sigmoidOneReg, oneOneReg, gateOneReg, floatMask);
+            Muls(sigmoidZeroReg, sigmoidZeroReg, lowerBound, floatMask);
+            Muls(sigmoidOneReg, sigmoidOneReg, lowerBound, floatMask);
+            Muls(sigmoidZeroReg, sigmoidZeroReg, KDA_BWD_RECOMPUTE_RCP_LN2, floatMask);
+            Muls(sigmoidOneReg, sigmoidOneReg, KDA_BWD_RECOMPUTE_RCP_LN2, floatMask);
             Add(accZeroReg, accZeroReg, sigmoidZeroReg, floatMask);
             Add(accOneReg, accOneReg, sigmoidOneReg, floatMask);
             StoreAlign(gk + rowOffset, accZeroReg, floatMask);
@@ -245,8 +252,6 @@ static __simd_vf__ inline void FusedRecomputeChunk128Regbase(
         Adds(lastOneReg, accOneReg, 0.0f, floatMask);
     }
 
-    MaskReg halfMask = CreateMask<half, MaskPattern::ALL>();
-    RegTensor<half> expHalfReg;
     RegTensor<float> betaReg;
     RegTensor<BetaT> betaRawReg;
     RegTensor<float> expZeroReg;
@@ -277,13 +282,9 @@ static __simd_vf__ inline void FusedRecomputeChunk128Regbase(
         LoadGateRegbasePair<InputT>(qZeroReg, qOneReg, q + rowOffset, inputMask, inputReg);
         LoadGateRegbasePair<InputT>(kZeroReg, kOneReg, k + rowOffset, inputMask, inputReg);
         LoadGateRegbasePair<InputT>(vZeroReg, vOneReg, v + rowOffset, inputMask, inputReg);
-        Muls(expZeroReg, gateZeroReg, kLn2, floatMask);
-        Muls(expOneReg, gateOneReg, kLn2, floatMask);
-        Mins(expZeroReg, expZeroReg, kHalfExpInputMax, floatMask);
-        Mins(expOneReg, expOneReg, kHalfExpInputMax, floatMask);
-        Maxs(expZeroReg, expZeroReg, kHalfExpInputMin, floatMask);
-        Maxs(expOneReg, expOneReg, kHalfExpInputMin, floatMask);
-        ExpPairViaHalf(expZeroReg, expOneReg, expHalfReg, floatMask, halfMask);
+        Adds(expZeroReg, gateZeroReg, 0.0f, floatMask);
+        Adds(expOneReg, gateOneReg, 0.0f, floatMask);
+        ExpPairStoredLog2(expZeroReg, expOneReg, floatMask);
 
         Mul(outZeroReg, qZeroReg, expZeroReg, floatMask);
         Mul(outOneReg, qOneReg, expOneReg, floatMask);
@@ -297,13 +298,7 @@ static __simd_vf__ inline void FusedRecomputeChunk128Regbase(
 
         Sub(deltaZeroReg, lastZeroReg, gateZeroReg, floatMask);
         Sub(deltaOneReg, lastOneReg, gateOneReg, floatMask);
-        Muls(deltaZeroReg, deltaZeroReg, kLn2, floatMask);
-        Muls(deltaOneReg, deltaOneReg, kLn2, floatMask);
-        Mins(deltaZeroReg, deltaZeroReg, kHalfExpInputMax, floatMask);
-        Mins(deltaOneReg, deltaOneReg, kHalfExpInputMax, floatMask);
-        Maxs(deltaZeroReg, deltaZeroReg, kHalfExpInputMin, floatMask);
-        Maxs(deltaOneReg, deltaOneReg, kHalfExpInputMin, floatMask);
-        ExpPairViaHalf(deltaZeroReg, deltaOneReg, expHalfReg, floatMask, halfMask);
+        ExpPairStoredLog2(deltaZeroReg, deltaOneReg, floatMask);
         Mul(outZeroReg, kZeroReg, deltaZeroReg, floatMask);
         Mul(outOneReg, kOneReg, deltaOneReg, floatMask);
         StoreGateRegbasePair<OutputT>(kg + rowOffset, outZeroReg, outOneReg, inputMask, floatMask, outputReg);

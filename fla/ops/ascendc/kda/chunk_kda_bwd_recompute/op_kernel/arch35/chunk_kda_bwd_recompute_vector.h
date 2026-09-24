@@ -719,22 +719,22 @@ private:
                 auto kgPtr = (__ubuf__ QkType *)outLocal.GetPhyAddr();
                 if (hasDtBias_ && hasALog_) {
                     KdaBwdRecomputeArch35::FusedRecomputeChunk128Regbase<
-                        QkType, QkType, GateType, BetaType, true, true>(
+                        QkType, QkType, GateType, BetaType, true, true, true>(
                         gPtr, gInPtr, biasPtr, aLogPtr, betaInPtr, qPtr, kPtr, vPtr, qPtr, kPtr, kgPtr, vPtr,
                         vfRows, lowerBound_);
                 } else if (hasDtBias_) {
                     KdaBwdRecomputeArch35::FusedRecomputeChunk128Regbase<
-                        QkType, QkType, GateType, BetaType, true, false>(
+                        QkType, QkType, GateType, BetaType, true, false, true>(
                         gPtr, gInPtr, biasPtr, aLogPtr, betaInPtr, qPtr, kPtr, vPtr, qPtr, kPtr, kgPtr, vPtr,
                         vfRows, lowerBound_);
                 } else if (hasALog_) {
                     KdaBwdRecomputeArch35::FusedRecomputeChunk128Regbase<
-                        QkType, QkType, GateType, BetaType, false, true>(
+                        QkType, QkType, GateType, BetaType, false, true, true>(
                         gPtr, gInPtr, biasPtr, aLogPtr, betaInPtr, qPtr, kPtr, vPtr, qPtr, kPtr, kgPtr, vPtr,
                         vfRows, lowerBound_);
                 } else {
                     KdaBwdRecomputeArch35::FusedRecomputeChunk128Regbase<
-                        QkType, QkType, GateType, BetaType, false, false>(
+                        QkType, QkType, GateType, BetaType, false, false, true>(
                         gPtr, gInPtr, biasPtr, aLogPtr, betaInPtr, qPtr, kPtr, vPtr, qPtr, kPtr, kgPtr, vPtr,
                         vfRows, lowerBound_);
                 }
