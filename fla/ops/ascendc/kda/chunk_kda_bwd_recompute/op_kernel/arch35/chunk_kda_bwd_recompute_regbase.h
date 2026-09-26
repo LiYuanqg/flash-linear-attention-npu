@@ -89,8 +89,57 @@ static __simd_vf__ inline void AccumulateSafeGateChunk128Regbase(
     StoreAlign(acc + FLOAT_ELEMENTS_PER_REG, accOneReg, floatMask);
 }
 
-// K-contiguous pair: regs hold [0:63] and [64:127], matching pass-1 gk StoreAlign.
-// DINTLV / CastHalf2Float ZERO+ONE deinterleave even/odd and scramble GM pairing.
+// FwdPrepare V0/V6 pairing: even/odd 64-lane regs, not K-contiguous [0:63]|[64:127].
+// Load: float DIST_DINTLV_B32; bf16 LoadIn + CastHalf2Float ZERO/ONE.
+// Store gk: DIST_INTLV_B32 so GM stays K-contiguous. Store bf16: CastFloat2Half packed.
+template <typename InputT>
+__simd_callee__ inline void LoadV0Pair(
+    AscendC::MicroAPI::RegTensor<float> &lowReg,
+    AscendC::MicroAPI::RegTensor<float> &highReg,
+    __ubuf__ InputT *src,
+    AscendC::MicroAPI::RegTensor<InputT> &packedReg)
+{
+    using namespace AscendC::MicroAPI;
+    if constexpr (std::is_same<InputT, float>::value) {
+        LoadAlign<float, LoadDist::DIST_DINTLV_B32>(lowReg, highReg, src);
+        (void)packedReg;
+    } else {
+        MaskReg packedMask = CreateMask<InputT, MaskPattern::ALL>();
+        LoadIn<InputT, false>(packedReg, src);
+        CastHalf2Float<InputT>(lowReg, highReg, packedReg, packedMask);
+    }
+}
+
+__simd_callee__ inline void StoreV0Gk(
+    __ubuf__ float *dst,
+    AscendC::MicroAPI::RegTensor<float> &lowReg,
+    AscendC::MicroAPI::RegTensor<float> &highReg,
+    AscendC::MicroAPI::MaskReg &floatMask)
+{
+    using namespace AscendC::MicroAPI;
+    StoreAlign<float, StoreDist::DIST_INTLV_B32>(dst, lowReg, highReg, floatMask);
+}
+
+template <typename OutputT>
+__simd_callee__ inline void StoreV6Packed(
+    __ubuf__ OutputT *dst,
+    AscendC::MicroAPI::RegTensor<float> &lowReg,
+    AscendC::MicroAPI::RegTensor<float> &highReg,
+    AscendC::MicroAPI::MaskReg &floatMask,
+    AscendC::MicroAPI::RegTensor<OutputT> &packedReg)
+{
+    using namespace AscendC::MicroAPI;
+    if constexpr (std::is_same<OutputT, float>::value) {
+        StoreAlign<float, StoreDist::DIST_INTLV_B32>(dst, lowReg, highReg, floatMask);
+        (void)packedReg;
+    } else {
+        MaskReg packedMask = CreateMask<OutputT, MaskPattern::ALL>();
+        CastFloat2Half(packedReg, lowReg, highReg, floatMask);
+        StoreAlign(dst, packedReg, packedMask);
+    }
+}
+
+// Fallback K-contiguous pair for non-fused paths: regs hold [0:63] and [64:127].
 template <typename InputT>
 __simd_callee__ inline void LoadGateRegbasePair(
     AscendC::MicroAPI::RegTensor<float> &zeroReg,
@@ -160,8 +209,9 @@ __simd_callee__ inline void ExpPairStoredLog2(
     Exp(oneReg, oneReg, floatMask);
 }
 
-// Full-chunk VF: pass-1 matches FwdPrepare V0 two-step log2 scale; pass-2
-// matches V6 stored-log2 clamp ±80 then *ln2 + fp32 Exp (not half Exp ±11).
+// Full-chunk VF: pass-1 matches FwdPrepare V0 even/odd DINTLV + two-step
+// log2 scale + INTLV store; pass-2 matches V6 DINTLV load, log2 clamp ±80,
+// *ln2, fp32 Exp, CastFloat2Half store. leftover must not enter this VF.
 template <typename InputT, typename OutputT, typename GateT, typename BetaT, bool HAS_BIAS, bool HAS_ALOG,
           bool kFixed64 = false>
 static __simd_vf__ inline void FusedRecomputeChunk128Regbase(
@@ -171,104 +221,93 @@ static __simd_vf__ inline void FusedRecomputeChunk128Regbase(
     uint16_t rows, float lowerBound)
 {
     using namespace AscendC::MicroAPI;
-    constexpr uint16_t FLOAT_ELEMENTS_PER_REG = AscendC::VECTOR_REG_WIDTH / sizeof(float);
-    constexpr uint16_t ROW_ELEMENTS = 2 * FLOAT_ELEMENTS_PER_REG;
+    constexpr uint16_t ROW_ELEMENTS = kK;
     const uint16_t nRows = kFixed64 ? static_cast<uint16_t>(64) : rows;
 
     MaskReg floatMask = CreateMask<float, MaskPattern::ALL>();
-    MaskReg inputMask = CreateMask<InputT, MaskPattern::ALL>();
     MaskReg betaMask = CreateMask<BetaT, MaskPattern::ALL>();
-    RegTensor<float> lastZeroReg;
-    RegTensor<float> lastOneReg;
-    RegTensor<float> gateZeroReg;
-    RegTensor<float> gateOneReg;
+    RegTensor<float> lastLowReg;
+    RegTensor<float> lastHighReg;
+    RegTensor<float> gateLowReg;
+    RegTensor<float> gateHighReg;
     {
-        RegTensor<float> accZeroReg;
-        RegTensor<float> accOneReg;
-        RegTensor<float> oneZeroReg;
-        RegTensor<float> oneOneReg;
-        RegTensor<float> biasZeroReg;
-        RegTensor<float> biasOneReg;
+        RegTensor<float> accLowReg;
+        RegTensor<float> accHighReg;
+        RegTensor<float> oneLowReg;
+        RegTensor<float> oneHighReg;
+        RegTensor<float> biasLowReg;
+        RegTensor<float> biasHighReg;
         RegTensor<float> expAReg;
-        RegTensor<float> sigmoidZeroReg;
-        RegTensor<float> sigmoidOneReg;
-        RegTensor<GateT> gateRawReg;
-        Duplicate(accZeroReg, 0.0f, floatMask);
-        Duplicate(accOneReg, 0.0f, floatMask);
-        Duplicate(oneZeroReg, 1.0f, floatMask);
-        Duplicate(oneOneReg, 1.0f, floatMask);
+        RegTensor<float> sigmoidLowReg;
+        RegTensor<float> sigmoidHighReg;
+        RegTensor<GateT> gatePackedReg;
+        Duplicate(accLowReg, 0.0f, floatMask);
+        Duplicate(accHighReg, 0.0f, floatMask);
+        Duplicate(oneLowReg, 1.0f, floatMask);
+        Duplicate(oneHighReg, 1.0f, floatMask);
         if constexpr (HAS_BIAS) {
-            LoadAlign<float, LoadDist::DIST_NORM>(biasZeroReg, bias);
-            LoadAlign<float, LoadDist::DIST_NORM>(biasOneReg, bias + FLOAT_ELEMENTS_PER_REG);
+            LoadAlign<float, LoadDist::DIST_DINTLV_B32>(biasLowReg, biasHighReg, bias);
         }
         if constexpr (HAS_ALOG) {
             LoadAlign<float, LoadDist::DIST_BRC_B32>(expAReg, aLog);
             Exp(expAReg, expAReg, floatMask);
-            Muls(expAReg, expAReg, -1.0f, floatMask);
         } else {
-            Duplicate(expAReg, -1.0f, floatMask);
+            Duplicate(expAReg, 1.0f, floatMask);
         }
 
         for (uint16_t row = 0; row < nRows; ++row) {
             const uint32_t rowOffset = static_cast<uint32_t>(row) * ROW_ELEMENTS;
             if constexpr (std::is_same<GateT, float>::value) {
-                LoadAlign<float, LoadDist::DIST_NORM>(gateZeroReg, gk + rowOffset);
-                LoadAlign<float, LoadDist::DIST_NORM>(gateOneReg, gk + rowOffset + FLOAT_ELEMENTS_PER_REG);
+                LoadV0Pair<float>(gateLowReg, gateHighReg, gk + rowOffset, gatePackedReg);
             } else {
-                // UNPACK+ZERO keeps K-contiguous fp32, matching UB Cast then DIST_NORM.
-                // CastHalf2Float ZERO/ONE deinterleaves even/odd and scrambles gk GM.
-                LoadAlign<GateT, LoadDist::DIST_UNPACK_B16>(gateRawReg, gIn + rowOffset);
-                Cast<float, GateT, ctHalf2Fp32Zero>(gateZeroReg, gateRawReg, floatMask);
-                LoadAlign<GateT, LoadDist::DIST_UNPACK_B16>(
-                    gateRawReg, gIn + rowOffset + FLOAT_ELEMENTS_PER_REG);
-                Cast<float, GateT, ctHalf2Fp32Zero>(gateOneReg, gateRawReg, floatMask);
+                LoadV0Pair<GateT>(gateLowReg, gateHighReg, gIn + rowOffset, gatePackedReg);
             }
             if constexpr (HAS_BIAS) {
-                Add(gateZeroReg, gateZeroReg, biasZeroReg, floatMask);
-                Add(gateOneReg, gateOneReg, biasOneReg, floatMask);
+                Add(gateLowReg, gateLowReg, biasLowReg, floatMask);
+                Add(gateHighReg, gateHighReg, biasHighReg, floatMask);
             }
-            Mul(gateZeroReg, gateZeroReg, expAReg, floatMask);
-            Mul(gateOneReg, gateOneReg, expAReg, floatMask);
-            Exp(gateZeroReg, gateZeroReg, floatMask);
-            Exp(gateOneReg, gateOneReg, floatMask);
-            Adds(gateZeroReg, gateZeroReg, 1.0f, floatMask);
-            Adds(gateOneReg, gateOneReg, 1.0f, floatMask);
-            Div(sigmoidZeroReg, oneZeroReg, gateZeroReg, floatMask);
-            Div(sigmoidOneReg, oneOneReg, gateOneReg, floatMask);
-            Muls(sigmoidZeroReg, sigmoidZeroReg, lowerBound, floatMask);
-            Muls(sigmoidOneReg, sigmoidOneReg, lowerBound, floatMask);
-            Muls(sigmoidZeroReg, sigmoidZeroReg, KDA_BWD_RECOMPUTE_RCP_LN2, floatMask);
-            Muls(sigmoidOneReg, sigmoidOneReg, KDA_BWD_RECOMPUTE_RCP_LN2, floatMask);
-            Add(accZeroReg, accZeroReg, sigmoidZeroReg, floatMask);
-            Add(accOneReg, accOneReg, sigmoidOneReg, floatMask);
-            StoreAlign(gk + rowOffset, accZeroReg, floatMask);
-            StoreAlign(gk + rowOffset + FLOAT_ELEMENTS_PER_REG, accOneReg, floatMask);
+            Mul(gateLowReg, gateLowReg, expAReg, floatMask);
+            Mul(gateHighReg, gateHighReg, expAReg, floatMask);
+            Muls(gateLowReg, gateLowReg, -1.0f, floatMask);
+            Muls(gateHighReg, gateHighReg, -1.0f, floatMask);
+            Exp(gateLowReg, gateLowReg, floatMask);
+            Exp(gateHighReg, gateHighReg, floatMask);
+            Adds(gateLowReg, gateLowReg, 1.0f, floatMask);
+            Adds(gateHighReg, gateHighReg, 1.0f, floatMask);
+            Div(sigmoidLowReg, oneLowReg, gateLowReg, floatMask);
+            Div(sigmoidHighReg, oneHighReg, gateHighReg, floatMask);
+            Muls(sigmoidLowReg, sigmoidLowReg, lowerBound, floatMask);
+            Muls(sigmoidHighReg, sigmoidHighReg, lowerBound, floatMask);
+            Muls(sigmoidLowReg, sigmoidLowReg, KDA_BWD_RECOMPUTE_RCP_LN2, floatMask);
+            Muls(sigmoidHighReg, sigmoidHighReg, KDA_BWD_RECOMPUTE_RCP_LN2, floatMask);
+            Add(accLowReg, accLowReg, sigmoidLowReg, floatMask);
+            Add(accHighReg, accHighReg, sigmoidHighReg, floatMask);
+            StoreV0Gk(gk + rowOffset, accLowReg, accHighReg, floatMask);
         }
-        // Last-row gk stays K-contiguous in acc{Zero,One} (NORM 0:63 | 64:127),
-        // matching pass-2 DIST_NORM / UNPACK loads. DeInterleave would switch
-        // last to even/odd and scramble kg. Reloading this row from UB can hoist
-        // before the accumulate loop and produce Inf kg = exp2(stale_g - cumsum).
-        Adds(lastZeroReg, accZeroReg, 0.0f, floatMask);
-        Adds(lastOneReg, accOneReg, 0.0f, floatMask);
+        // last stays even/odd in registers, matching V0 gLast DIST_NORM of
+        // DINTLV lanes. Do not reload last from the INTLV gk row.
+        Adds(lastLowReg, accLowReg, 0.0f, floatMask);
+        Adds(lastHighReg, accHighReg, 0.0f, floatMask);
     }
+    LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
 
     RegTensor<float> betaReg;
     RegTensor<BetaT> betaRawReg;
-    RegTensor<float> expZeroReg;
-    RegTensor<float> expOneReg;
-    RegTensor<float> qZeroReg;
-    RegTensor<float> qOneReg;
-    RegTensor<float> kZeroReg;
-    RegTensor<float> kOneReg;
-    RegTensor<float> outZeroReg;
-    RegTensor<float> outOneReg;
-    RegTensor<float> deltaZeroReg;
-    RegTensor<float> deltaOneReg;
-    RegTensor<float> vZeroReg;
-    RegTensor<float> vOneReg;
+    RegTensor<float> expLowReg;
+    RegTensor<float> expHighReg;
+    RegTensor<float> qLowReg;
+    RegTensor<float> qHighReg;
+    RegTensor<float> kLowReg;
+    RegTensor<float> kHighReg;
+    RegTensor<float> outLowReg;
+    RegTensor<float> outHighReg;
+    RegTensor<float> deltaLowReg;
+    RegTensor<float> deltaHighReg;
+    RegTensor<float> vLowReg;
+    RegTensor<float> vHighReg;
     RegTensor<InputT> inputReg;
     RegTensor<OutputT> outputReg;
-    RegTensor<float> floatScratchReg;
+    RegTensor<float> gkPackedReg;
     for (uint16_t row = 0; row < nRows; ++row) {
         const uint32_t rowOffset = static_cast<uint32_t>(row) * static_cast<uint32_t>(kK);
         if constexpr (std::is_same<BetaT, float>::value) {
@@ -278,34 +317,34 @@ static __simd_vf__ inline void FusedRecomputeChunk128Regbase(
             HalfOrFloat2Float(betaReg, betaRawReg, betaMask, floatMask);
         }
 
-        LoadGateRegbasePair<float>(gateZeroReg, gateOneReg, gk + rowOffset, inputMask, floatScratchReg);
-        LoadGateRegbasePair<InputT>(qZeroReg, qOneReg, q + rowOffset, inputMask, inputReg);
-        LoadGateRegbasePair<InputT>(kZeroReg, kOneReg, k + rowOffset, inputMask, inputReg);
-        LoadGateRegbasePair<InputT>(vZeroReg, vOneReg, v + rowOffset, inputMask, inputReg);
-        Adds(expZeroReg, gateZeroReg, 0.0f, floatMask);
-        Adds(expOneReg, gateOneReg, 0.0f, floatMask);
-        ExpPairStoredLog2(expZeroReg, expOneReg, floatMask);
+        LoadV0Pair<float>(gateLowReg, gateHighReg, gk + rowOffset, gkPackedReg);
+        LoadV0Pair<InputT>(qLowReg, qHighReg, q + rowOffset, inputReg);
+        LoadV0Pair<InputT>(kLowReg, kHighReg, k + rowOffset, inputReg);
+        LoadV0Pair<InputT>(vLowReg, vHighReg, v + rowOffset, inputReg);
+        Adds(expLowReg, gateLowReg, 0.0f, floatMask);
+        Adds(expHighReg, gateHighReg, 0.0f, floatMask);
+        ExpPairStoredLog2(expLowReg, expHighReg, floatMask);
 
-        Mul(outZeroReg, qZeroReg, expZeroReg, floatMask);
-        Mul(outOneReg, qOneReg, expOneReg, floatMask);
-        StoreGateRegbasePair<OutputT>(qg + rowOffset, outZeroReg, outOneReg, inputMask, floatMask, outputReg);
+        Mul(outLowReg, qLowReg, expLowReg, floatMask);
+        Mul(outHighReg, qHighReg, expHighReg, floatMask);
+        StoreV6Packed<OutputT>(qg + rowOffset, outLowReg, outHighReg, floatMask, outputReg);
 
-        Mul(outZeroReg, kZeroReg, expZeroReg, floatMask);
-        Mul(outOneReg, kOneReg, expOneReg, floatMask);
-        Mul(outZeroReg, outZeroReg, betaReg, floatMask);
-        Mul(outOneReg, outOneReg, betaReg, floatMask);
-        StoreGateRegbasePair<OutputT>(kbg + rowOffset, outZeroReg, outOneReg, inputMask, floatMask, outputReg);
+        Mul(outLowReg, kLowReg, expLowReg, floatMask);
+        Mul(outHighReg, kHighReg, expHighReg, floatMask);
+        Mul(outLowReg, outLowReg, betaReg, floatMask);
+        Mul(outHighReg, outHighReg, betaReg, floatMask);
+        StoreV6Packed<OutputT>(kbg + rowOffset, outLowReg, outHighReg, floatMask, outputReg);
 
-        Sub(deltaZeroReg, lastZeroReg, gateZeroReg, floatMask);
-        Sub(deltaOneReg, lastOneReg, gateOneReg, floatMask);
-        ExpPairStoredLog2(deltaZeroReg, deltaOneReg, floatMask);
-        Mul(outZeroReg, kZeroReg, deltaZeroReg, floatMask);
-        Mul(outOneReg, kOneReg, deltaOneReg, floatMask);
-        StoreGateRegbasePair<OutputT>(kg + rowOffset, outZeroReg, outOneReg, inputMask, floatMask, outputReg);
+        Sub(deltaLowReg, lastLowReg, gateLowReg, floatMask);
+        Sub(deltaHighReg, lastHighReg, gateHighReg, floatMask);
+        ExpPairStoredLog2(deltaLowReg, deltaHighReg, floatMask);
+        Mul(outLowReg, kLowReg, deltaLowReg, floatMask);
+        Mul(outHighReg, kHighReg, deltaHighReg, floatMask);
+        StoreV6Packed<OutputT>(kg + rowOffset, outLowReg, outHighReg, floatMask, outputReg);
 
-        Mul(vZeroReg, vZeroReg, betaReg, floatMask);
-        Mul(vOneReg, vOneReg, betaReg, floatMask);
-        StoreGateRegbasePair<OutputT>(vb + rowOffset, vZeroReg, vOneReg, inputMask, floatMask, outputReg);
+        Mul(vLowReg, vLowReg, betaReg, floatMask);
+        Mul(vHighReg, vHighReg, betaReg, floatMask);
+        StoreV6Packed<OutputT>(vb + rowOffset, vLowReg, vHighReg, floatMask, outputReg);
     }
 }
 

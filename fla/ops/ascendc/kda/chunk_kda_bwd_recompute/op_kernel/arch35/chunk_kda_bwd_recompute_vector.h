@@ -106,18 +106,17 @@ private:
         WaitFlag<HardEvent::MTE2_V>(mte2Event);
     }
 
-    // Full 64-row VF still disagrees with FwdPrepare gk (CMP body_max ~0.23
-    // after V0 two-step + V6 fp32 Exp). leftover tail is closer, so every
-    // tile including kBt uses this row loop. Matching V0 (safe-sigmoid +
-    // two-step log2 scale + cumsum) and V6 (fp32 Exp, log2 clamp ±80).
-    // Caller leaves raw q/k/v/g in UB; do not run VF first.
+    // Leftover must not enter FusedRecomputeChunk128Regbase. The VF software
+    // pipeline can accumulate extra rows, so Glast (and every kg in the tile)
+    // drifts. Rebuild gk/qg/kg/kbg/vb for validRows only.
+    // Full 64-row tiles use FusedRecompute with V0 DINTLV/INTLV pairing.
     __aicore__ inline void RepairLeftoverChunk(
         uint32_t buf, uint32_t loopIdx, uint64_t h, uint32_t bos, uint32_t curChunkSize)
     {
         constexpr uint32_t kk = KdaBwdRecomputeArch35::kK;
         (void)loopIdx;
         (void)bos;
-        if (curChunkSize == 0U || curChunkSize > KdaBwdRecomputeArch35::kBt) {
+        if (curChunkSize == 0U || curChunkSize >= KdaBwdRecomputeArch35::kBt) {
             return;
         }
         auto gFp32 = gFp32Buf_[buf].Get<float>();
@@ -296,12 +295,61 @@ private:
     __aicore__ inline void FastRunVf(
         uint32_t buf, uint32_t loopIdx, uint64_t h, uint32_t bos, uint32_t curChunkSize)
     {
+        auto gFp32 = gFp32Buf_[buf].Get<float>();
+        auto qLocal = qBuf_[buf].Get<QkType>();
         auto kLocal = kBuf_[buf].Get<QkType>();
         auto vLocal = vBuf_[buf].Get<QkType>();
+        auto outLocal = outBuf_[buf].Get<QkType>();
+        auto betaFp32 = betaFp32Buf_[buf].Get<float>();
+        auto dtBias = dtBiasBuf_[buf].Get<float>();
+        auto aLogAll = aLogAllBuf_.Get<float>();
 
         WaitFlag<HardEvent::MTE2_V>(mte2ToVEvent_[buf]);
-        if (curChunkSize > 0U && curChunkSize <= KdaBwdRecomputeArch35::kBt) {
+        if (curChunkSize > 0U && curChunkSize < KdaBwdRecomputeArch35::kBt) {
             RepairLeftoverChunk(buf, loopIdx, h, bos, curChunkSize);
+        } else if (curChunkSize == KdaBwdRecomputeArch35::kBt) {
+            __ubuf__ float *aLogPtr = hasALog_ ?
+                ((__ubuf__ float *)aLogAll.GetPhyAddr() + static_cast<uint32_t>(h)) : nullptr;
+            __ubuf__ float *gPtr = (__ubuf__ float *)gFp32.GetPhyAddr();
+            __ubuf__ float *biasPtr = (__ubuf__ float *)dtBias.GetPhyAddr();
+            __ubuf__ GateType *gInPtr;
+            if constexpr (std::is_same<GateType, float>::value) {
+                gInPtr = (__ubuf__ GateType *)gPtr;
+            } else {
+                gInPtr = (__ubuf__ GateType *)outLocal.GetPhyAddr();
+            }
+            __ubuf__ BetaType *betaInPtr;
+            if constexpr (std::is_same<BetaType, float>::value) {
+                betaInPtr = (__ubuf__ BetaType *)betaFp32.GetPhyAddr();
+            } else {
+                betaInPtr = (__ubuf__ BetaType *)betaRawBuf_[buf].Get<BetaType>().GetPhyAddr();
+            }
+            const uint16_t vfRows = static_cast<uint16_t>(curChunkSize);
+            auto qPtr = (__ubuf__ QkType *)qLocal.GetPhyAddr();
+            auto kPtr = (__ubuf__ QkType *)kLocal.GetPhyAddr();
+            auto vPtr = (__ubuf__ QkType *)vLocal.GetPhyAddr();
+            auto kgPtr = (__ubuf__ QkType *)outLocal.GetPhyAddr();
+            if (hasDtBias_ && hasALog_) {
+                KdaBwdRecomputeArch35::FusedRecomputeChunk128Regbase<
+                    QkType, QkType, GateType, BetaType, true, true, true>(
+                    gPtr, gInPtr, biasPtr, aLogPtr, betaInPtr, qPtr, kPtr, vPtr, qPtr, kPtr, kgPtr, vPtr,
+                    vfRows, lowerBound_);
+            } else if (hasDtBias_) {
+                KdaBwdRecomputeArch35::FusedRecomputeChunk128Regbase<
+                    QkType, QkType, GateType, BetaType, true, false, true>(
+                    gPtr, gInPtr, biasPtr, aLogPtr, betaInPtr, qPtr, kPtr, vPtr, qPtr, kPtr, kgPtr, vPtr,
+                    vfRows, lowerBound_);
+            } else if (hasALog_) {
+                KdaBwdRecomputeArch35::FusedRecomputeChunk128Regbase<
+                    QkType, QkType, GateType, BetaType, false, true, true>(
+                    gPtr, gInPtr, biasPtr, aLogPtr, betaInPtr, qPtr, kPtr, vPtr, qPtr, kPtr, kgPtr, vPtr,
+                    vfRows, lowerBound_);
+            } else {
+                KdaBwdRecomputeArch35::FusedRecomputeChunk128Regbase<
+                    QkType, QkType, GateType, BetaType, false, false, true>(
+                    gPtr, gInPtr, biasPtr, aLogPtr, betaInPtr, qPtr, kPtr, vPtr, qPtr, kPtr, kgPtr, vPtr,
+                    vfRows, lowerBound_);
+            }
         }
         PipeBarrier<PIPE_V>();
         const uint32_t padRows = KdaBwdRecomputeArch35::PadMmadRows(curChunkSize);
@@ -644,8 +692,51 @@ private:
 
         if (useGate_ && useExp2_) {
             PipeBarrier<PIPE_V>();
-            if (curChunkSize > 0U && curChunkSize <= KdaBwdRecomputeArch35::kBt) {
+            if (curChunkSize > 0U && curChunkSize < KdaBwdRecomputeArch35::kBt) {
                 RepairLeftoverChunk(0, loopIdx, h, bos, curChunkSize);
+            } else if (curChunkSize == KdaBwdRecomputeArch35::kBt) {
+                __ubuf__ float *aLogPtr = hasALog_ ?
+                    ((__ubuf__ float *)aLogAll.GetPhyAddr() + static_cast<uint32_t>(h)) : nullptr;
+                __ubuf__ float *gPtr = (__ubuf__ float *)gFp32.GetPhyAddr();
+                __ubuf__ float *biasPtr = (__ubuf__ float *)dtBias.GetPhyAddr();
+                __ubuf__ GateType *gInPtr;
+                if constexpr (std::is_same<GateType, float>::value) {
+                    gInPtr = (__ubuf__ GateType *)gPtr;
+                } else {
+                    gInPtr = (__ubuf__ GateType *)outLocal.GetPhyAddr();
+                }
+                __ubuf__ BetaType *betaInPtr;
+                if constexpr (std::is_same<BetaType, float>::value) {
+                    betaInPtr = (__ubuf__ BetaType *)betaFp32.GetPhyAddr();
+                } else {
+                    betaInPtr = (__ubuf__ BetaType *)betaRawBuf_[0].Get<BetaType>().GetPhyAddr();
+                }
+                const uint16_t vfRows = static_cast<uint16_t>(curChunkSize);
+                auto qPtr = (__ubuf__ QkType *)qLocal.GetPhyAddr();
+                auto kPtr = (__ubuf__ QkType *)kLocal.GetPhyAddr();
+                auto vPtr = (__ubuf__ QkType *)vLocal.GetPhyAddr();
+                auto kgPtr = (__ubuf__ QkType *)outLocal.GetPhyAddr();
+                if (hasDtBias_ && hasALog_) {
+                    KdaBwdRecomputeArch35::FusedRecomputeChunk128Regbase<
+                        QkType, QkType, GateType, BetaType, true, true, true>(
+                        gPtr, gInPtr, biasPtr, aLogPtr, betaInPtr, qPtr, kPtr, vPtr, qPtr, kPtr, kgPtr, vPtr,
+                        vfRows, lowerBound_);
+                } else if (hasDtBias_) {
+                    KdaBwdRecomputeArch35::FusedRecomputeChunk128Regbase<
+                        QkType, QkType, GateType, BetaType, true, false, true>(
+                        gPtr, gInPtr, biasPtr, aLogPtr, betaInPtr, qPtr, kPtr, vPtr, qPtr, kPtr, kgPtr, vPtr,
+                        vfRows, lowerBound_);
+                } else if (hasALog_) {
+                    KdaBwdRecomputeArch35::FusedRecomputeChunk128Regbase<
+                        QkType, QkType, GateType, BetaType, false, true, true>(
+                        gPtr, gInPtr, biasPtr, aLogPtr, betaInPtr, qPtr, kPtr, vPtr, qPtr, kPtr, kgPtr, vPtr,
+                        vfRows, lowerBound_);
+                } else {
+                    KdaBwdRecomputeArch35::FusedRecomputeChunk128Regbase<
+                        QkType, QkType, GateType, BetaType, false, false, true>(
+                        gPtr, gInPtr, biasPtr, aLogPtr, betaInPtr, qPtr, kPtr, vPtr, qPtr, kPtr, kgPtr, vPtr,
+                        vfRows, lowerBound_);
+                }
             }
             PipeBarrier<PIPE_V>();
             const uint32_t padRows = KdaBwdRecomputeArch35::PadMmadRows(curChunkSize);
