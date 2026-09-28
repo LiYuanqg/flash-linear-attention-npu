@@ -111,7 +111,7 @@ L2 的输出档位用整档匹配，实际接受四种 mask：`none`（六个必
 
 | Stage | 核 | 内容 |
 | --- | --- | --- |
-| V0 | Vector | norm、beta、gate、cumsum，生成并写出 Q/K 保存量与 `gk/beta_eff` |
+| V0 | Vector | 一次 VF：先 gate cumsum 写 `gk`，再 Q/K L2 与 beta，写出 Q/K 保存量与 `beta_eff` |
 | V1 | Vector | 一次 VF 生成 S=4 的 `Qplus/Kplus/Kminus` |
 | C2 | Cube | 四个 stacked band MMAD，同时生成 raw Aqk/raw Akk |
 | V3 | Vector | causal mask、beta、叶子逆，生成 Aqk/B/X0/X1/negX1/Akk |
@@ -121,7 +121,9 @@ L2 的输出档位用整档匹配，实际接受四种 mask：`none`（六个必
 | C7 | Cube | 计算 W/U |
 
 每个 Vector Stage 只调用一次 VF；VF 循环体中只有 `if constexpr` 模式分支。每个 Stage
-只属于 Vector 或 Cube 一类，Cube 不读取同一 Stage 新生成的数据。
+只属于 Vector 或 Cube 一类，Cube 不读取同一 Stage 新生成的数据。Arch35 V0 在同一次
+VF 内用两个行循环分别做 gate 前缀和与 Q/K L2，二者写不同 UB 区、无数据依赖；合并进
+同一行循环会在 950DT 上污染 `carry`/`bias`。Arch22 V0 本身已先 norm 再 gate。
 
 ## 4. C2 分块
 

@@ -135,8 +135,8 @@ __simd_callee__ inline void ExpPair(
     Exp(high, high, mask);
 }
 
-// V0 的循环和指令均属于一次 VF。有效行和尾行分开执行，
-// 保证循环体中只有编译期模式分支。
+// V0 仍是一次 VF。gate 前缀和与 Q/K L2 分成两个行循环，避免同一轮
+// ReduceSum 污染 carry/bias（950DT 上 Prepare gk 相对 host 单行约 0.014）。
 template <typename GateT, typename BetaT, typename CompilePolicy,
           bool BETA_SEQUENCE_MAJOR>
 __simd_vf__ inline void StageV0Vf(
@@ -152,32 +152,89 @@ __simd_vf__ inline void StageV0Vf(
     MaskReg mask = CreateMask<float, MaskPattern::ALL>();
     uint32_t scalarCount = 1;
     MaskReg scalarMask = UpdateMask<float>(scalarCount);
-    RegTensor<float> carryLow;
-    RegTensor<float> carryHigh;
-    RegTensor<float> biasLow;
-    RegTensor<float> biasHigh;
-    RegTensor<float> a;
-    Duplicate(carryLow, 0.0F, mask);
-    Duplicate(carryHigh, 0.0F, mask);
 
-    // dt_bias 和 A_log 都是 head 常量，在行循环前只判断和读取一次。
-    if constexpr (CompilePolicy::gateMode != GateMode::PrecomputedStep) {
-        if (hasDtBias) {
-            LoadAlign<float, LoadDist::DIST_DINTLV_B32>(
-                biasLow, biasHigh, dtBias);
-        } else {
-            Duplicate(biasLow, 0.0F, mask);
-            Duplicate(biasHigh, 0.0F, mask);
+    {
+        RegTensor<float> carryLow;
+        RegTensor<float> carryHigh;
+        Duplicate(carryLow, 0.0F, mask);
+        Duplicate(carryHigh, 0.0F, mask);
+        RegTensor<float> biasLow;
+        RegTensor<float> biasHigh;
+        RegTensor<float> a;
+        if constexpr (CompilePolicy::gateMode != GateMode::PrecomputedStep) {
+            if (hasDtBias) {
+                LoadAlign<float, LoadDist::DIST_DINTLV_B32>(
+                    biasLow, biasHigh, dtBias);
+            } else {
+                Duplicate(biasLow, 0.0F, mask);
+                Duplicate(biasHigh, 0.0F, mask);
+            }
+            if (hasALog) {
+                LoadScalarAsFp32(a, aLog);
+                Exp(a, a, mask);
+            } else {
+                Duplicate(a, 1.0F, mask);
+            }
         }
-        if (hasALog) {
-            LoadScalarAsFp32(a, aLog);
-            Exp(a, a, mask); // 计算 a_h=exp(A_log[h])。
-        } else {
-            Duplicate(a, 1.0F, mask);
+        for (uint16_t row = 0; row < validRows; ++row) {
+            RegTensor<float> gateLow;
+            RegTensor<float> gateHigh;
+            Load128AsFp32(gateLow, gateHigh, rawGate + row * Shape::kHeadDim);
+            if constexpr (CompilePolicy::gateMode != GateMode::PrecomputedStep) {
+                Add(gateLow, gateLow, biasLow, mask);
+                Add(gateHigh, gateHigh, biasHigh, mask);
+                if constexpr (CompilePolicy::safeGate ||
+                              CompilePolicy::gateMode == GateMode::SafeSigmoid) {
+                    RegTensor<float> one;
+                    Duplicate(one, 1.0F, mask);
+                    Mul(gateLow, gateLow, a, mask);
+                    Mul(gateHigh, gateHigh, a, mask);
+                    Muls(gateLow, gateLow, -1.0F, mask);
+                    Muls(gateHigh, gateHigh, -1.0F, mask);
+                    Exp(gateLow, gateLow, mask);
+                    Exp(gateHigh, gateHigh, mask);
+                    Adds(gateLow, gateLow, 1.0F, mask);
+                    Adds(gateHigh, gateHigh, 1.0F, mask);
+                    Div(gateLow, one, gateLow, mask);
+                    Div(gateHigh, one, gateHigh, mask);
+                    Muls(gateLow, gateLow, lowerBound, mask);
+                    Muls(gateHigh, gateHigh, lowerBound, mask);
+                } else {
+                    RegTensor<float> positiveLow;
+                    RegTensor<float> positiveHigh;
+                    RegTensor<float> softplusLow;
+                    RegTensor<float> softplusHigh;
+                    Maxs(positiveLow, gateLow, 0.0F, mask);
+                    Maxs(positiveHigh, gateHigh, 0.0F, mask);
+                    Abs(softplusLow, gateLow, mask);
+                    Abs(softplusHigh, gateHigh, mask);
+                    Muls(softplusLow, softplusLow, -1.0F, mask);
+                    Muls(softplusHigh, softplusHigh, -1.0F, mask);
+                    Exp(softplusLow, softplusLow, mask);
+                    Exp(softplusHigh, softplusHigh, mask);
+                    Adds(softplusLow, softplusLow, 1.0F, mask);
+                    Adds(softplusHigh, softplusHigh, 1.0F, mask);
+                    Ln(softplusLow, softplusLow, mask);
+                    Ln(softplusHigh, softplusHigh, mask);
+                    Add(gateLow, positiveLow, softplusLow, mask);
+                    Add(gateHigh, positiveHigh, softplusHigh, mask);
+                    Mul(gateLow, gateLow, a, mask);
+                    Mul(gateHigh, gateHigh, a, mask);
+                    Muls(gateLow, gateLow, -1.0F, mask);
+                    Muls(gateHigh, gateHigh, -1.0F, mask);
+                }
+            }
+            if constexpr (Domain::useExp2) {
+                Muls(gateLow, gateLow, Domain::stepScale, mask);
+                Muls(gateHigh, gateHigh, Domain::stepScale, mask);
+            }
+            Add(carryLow, carryLow, gateLow, mask);
+            Add(carryHigh, carryHigh, gateHigh, mask);
+            StoreAlign<float, StoreDist::DIST_INTLV_B32>(
+                g + row * Shape::kHeadDim, carryLow, carryHigh, mask);
         }
     }
 
-    // 有效行内直接展示 Q/K 归一化、gate 变换和前缀和。
     for (uint16_t row = 0; row < validRows; ++row) {
         RegTensor<float> qLow;
         RegTensor<float> qHigh;
@@ -202,8 +259,6 @@ __simd_vf__ inline void StageV0Vf(
             ReduceSum(qSumHigh, qSquareHigh, mask);
             ReduceSum(kSumLow, kSquareLow, mask);
             ReduceSum(kSumHigh, kSquareHigh, mask);
-            // ReduceSum 只保证首 lane 有效。rstd 供当前行归一化广播，
-            // 需要反向保存量时再落入 UB 并由 MTE3 写回。
             Add(qSumLow, qSumLow, qSumHigh, scalarMask);
             Add(kSumLow, kSumLow, kSumHigh, scalarMask);
             Adds(qSumLow, qSumLow, epsilon, scalarMask);
@@ -220,8 +275,6 @@ __simd_vf__ inline void StageV0Vf(
                 DataCopy<float, StoreDist::DIST_FIRST_ELEMENT_B32>(
                     kRstd + row, kSumLow, scalarMask);
             }
-            // ReduceSum 的最低 lane 已是最终 rstd，直接在寄存器内广播，
-            // 不再为当前行计算做 UB 往返。
             RegTensor<float> qScale;
             RegTensor<float> kScale;
             Duplicate(qScale, qSumLow, mask);
@@ -231,7 +284,6 @@ __simd_vf__ inline void StageV0Vf(
             Mul(kLow, kLow, kScale, mask);
             Mul(kHigh, kHigh, kScale, mask);
         } else {
-            // Identity 模式仅在需要反向保存量时产生公开的 rstd=1。
             if constexpr (CompilePolicy::outputMode != OutputMode::None) {
                 RegTensor<float> one;
                 Duplicate(one, 1.0F, scalarMask);
@@ -243,63 +295,6 @@ __simd_vf__ inline void StageV0Vf(
         }
         Store128FromFp32(q + row * Shape::kHeadDim, qLow, qHigh);
         Store128FromFp32(k + row * Shape::kHeadDim, kLow, kHigh);
-
-        RegTensor<float> gateLow;
-        RegTensor<float> gateHigh;
-        Load128AsFp32(gateLow, gateHigh, rawGate + row * Shape::kHeadDim);
-        if constexpr (CompilePolicy::gateMode != GateMode::PrecomputedStep) {
-            Add(gateLow, gateLow, biasLow, mask);
-            Add(gateHigh, gateHigh, biasHigh, mask);
-            if constexpr (CompilePolicy::safeGate ||
-                          CompilePolicy::gateMode == GateMode::SafeSigmoid) {
-                RegTensor<float> one;
-                Duplicate(one, 1.0F, mask);
-                Mul(gateLow, gateLow, a, mask);
-                Mul(gateHigh, gateHigh, a, mask);
-                Muls(gateLow, gateLow, -1.0F, mask);
-                Muls(gateHigh, gateHigh, -1.0F, mask);
-                Exp(gateLow, gateLow, mask);
-                Exp(gateHigh, gateHigh, mask);
-                Adds(gateLow, gateLow, 1.0F, mask);
-                Adds(gateHigh, gateHigh, 1.0F, mask);
-                Div(gateLow, one, gateLow, mask);
-                Div(gateHigh, one, gateHigh, mask);
-                Muls(gateLow, gateLow, lowerBound, mask);
-                Muls(gateHigh, gateHigh, lowerBound, mask);
-            } else {
-                RegTensor<float> positiveLow;
-                RegTensor<float> positiveHigh;
-                RegTensor<float> softplusLow;
-                RegTensor<float> softplusHigh;
-                Maxs(positiveLow, gateLow, 0.0F, mask);
-                Maxs(positiveHigh, gateHigh, 0.0F, mask);
-                Abs(softplusLow, gateLow, mask);
-                Abs(softplusHigh, gateHigh, mask);
-                Muls(softplusLow, softplusLow, -1.0F, mask);
-                Muls(softplusHigh, softplusHigh, -1.0F, mask);
-                Exp(softplusLow, softplusLow, mask);
-                Exp(softplusHigh, softplusHigh, mask);
-                Adds(softplusLow, softplusLow, 1.0F, mask);
-                Adds(softplusHigh, softplusHigh, 1.0F, mask);
-                Ln(softplusLow, softplusLow, mask);
-                Ln(softplusHigh, softplusHigh, mask);
-                Add(gateLow, positiveLow, softplusLow, mask);
-                Add(gateHigh, positiveHigh, softplusHigh, mask);
-                Mul(gateLow, gateLow, a, mask);
-                Mul(gateHigh, gateHigh, a, mask);
-                Muls(gateLow, gateLow, -1.0F, mask);
-                Muls(gateHigh, gateHigh, -1.0F, mask);
-            }
-        }
-        // USE_EXP2=true 时 G 保存 log2 值；false 时保存自然对数值。
-        if constexpr (Domain::useExp2) {
-            Muls(gateLow, gateLow, Domain::stepScale, mask);
-            Muls(gateHigh, gateHigh, Domain::stepScale, mask);
-        }
-        Add(carryLow, carryLow, gateLow, mask);
-        Add(carryHigh, carryHigh, gateHigh, mask);
-        StoreAlign<float, StoreDist::DIST_INTLV_B32>(
-            g + row * Shape::kHeadDim, carryLow, carryHigh, mask);
     }
 
     // G 先完整落到 UB，然后在循环外取四个局部参考行。
