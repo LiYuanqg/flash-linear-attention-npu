@@ -4666,6 +4666,44 @@ def npu_merge_fwd_bwd_kernel(
         raise RuntimeError(
             "npu_merge_fwd_bwd_kernel: h must be [HV, 128, 128] matching ag_hm dtype."
         )
+    if not h.is_contiguous():
+        raise RuntimeError(
+            "npu_merge_fwd_bwd_kernel: h is written in place and must be contiguous."
+        )
+    if not (1 <= s <= 1024 and 1 <= hv <= 256):
+        raise RuntimeError(
+            "npu_merge_fwd_bwd_kernel: S must be in [1, 1024] and HV in [1, 256]."
+        )
+    n_ranks = int(pre_or_post_num_ranks)
+    if not (1 <= n_ranks <= s):
+        raise RuntimeError(
+            f"npu_merge_fwd_bwd_kernel: pre_or_post_num_ranks must be in [1, S={s}]."
+        )
+    unit_world = s == 1 and n_ranks == 1 and int(rank) == 0
+    if not unit_world:
+        if forward and int(rank) < n_ranks:
+            raise RuntimeError("npu_merge_fwd_bwd_kernel: forward merge requires rank >= N.")
+        if not forward and int(rank) + n_ranks >= s:
+            raise RuntimeError("npu_merge_fwd_bwd_kernel: backward merge requires rank + N < S.")
+
+    def public_format(tensor, name):
+        loaded_torch_npu = sys.modules.get("torch_npu")
+        if loaded_torch_npu is not None:
+            try:
+                actual_format = int(loaded_torch_npu.get_npu_format(tensor))
+            except Exception as exc:
+                raise RuntimeError(
+                    f"npu_merge_fwd_bwd_kernel: cannot determine the real NPU format of {name}."
+                ) from exc
+        else:
+            actual_format = _acl_format(tensor)
+        if actual_format not in {ACL_FORMAT_NCHW, ACL_FORMAT_ND, ACL_FORMAT_NCDHW, ACL_FORMAT_NCL}:
+            raise RuntimeError(
+                f"npu_merge_fwd_bwd_kernel: {name} must use a non-private format, got {actual_format}."
+            )
+
+    public_format(h, "h")
+    public_format(ag_hm, "ag_hm")
 
     def nd_tensor(ctx, tensor, name):
         return ctx.tensor(
@@ -4676,18 +4714,17 @@ def npu_merge_fwd_bwd_kernel(
         )
 
     ag_work = ag_hm.contiguous()
-    h_work = h.contiguous()
     return _call_aclnn(
         "aclnnMergeFwdBwdKernel",
         lambda ctx: [
-            nd_tensor(ctx, h_work, "h"),
+            nd_tensor(ctx, h, "h"),
             nd_tensor(ctx, ag_work, "ag_hm"),
             ctypes.c_int64(int(pre_or_post_num_ranks)),
             ctypes.c_int64(int(rank)),
             ctypes.c_bool(bool(forward)),
             ctypes.c_bool(bool(state_v_first)),
         ],
-        h_work,
+        h,
     )
 
 

@@ -44,7 +44,9 @@ aclnnStatus aclnnMergeFwdBwdKernelGetWorkspaceSize(
 | 名称 | dtype | shape | 语义 |
 | --- | --- | --- | --- |
 | `ag_hm` | FP32 / BF16 | `[S, HV, 128, 256]` | 每个 rank 的 `He`（前 128 列）和 `M`（后 128 列） |
-| `h` | 与 `ag_hm` 相同 | `[HV, 128, 128]` | inplace 输出缓冲 |
+| `h` | 与 `ag_hm` 相同 | `[HV, 128, 128]` | inplace 输出缓冲，必须连续 |
+
+`h` 由 kernel 直接写入，非连续在 aclnn 入口拒绝。`ag_hm` 可以不连续，host 会先收成连续再读。两者的 storage/view format 必须是非私有格式（ND、NCHW、NCL、NHWC 这类连续排布）。NZ 等私有格式在入口直接拒绝。
 
 ## 属性
 

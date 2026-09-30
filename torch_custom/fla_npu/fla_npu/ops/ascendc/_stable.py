@@ -1943,7 +1943,25 @@ def npu_merge_fwd_bwd_kernel(
     """
 
     if not h.is_contiguous():
-        h = h.contiguous()
+        raise RuntimeError(
+            "npu_merge_fwd_bwd_kernel: h is written in place and must be contiguous."
+        )
+    loaded_torch_npu = sys.modules.get("torch_npu")
+    if loaded_torch_npu is not None:
+        # NCHW=0, ND=2, NCDHW=30, NCL=47. Same public set as the ctypes path.
+        public_formats = {0, 2, 30, 47}
+        for name, tensor in (("h", h), ("ag_hm", ag_hm)):
+            try:
+                actual_format = int(loaded_torch_npu.get_npu_format(tensor))
+            except Exception as exc:
+                raise RuntimeError(
+                    f"npu_merge_fwd_bwd_kernel: cannot determine the real NPU format of {name}."
+                ) from exc
+            if actual_format not in public_formats:
+                raise RuntimeError(
+                    f"npu_merge_fwd_bwd_kernel: {name} must use a non-private format, "
+                    f"got {actual_format}."
+                )
     return _op("npu_merge_fwd_bwd_kernel")(
         h, ag_hm, int(pre_or_post_num_ranks), int(rank), bool(forward),
         bool(state_v_first), _current_stream_ptr(),
